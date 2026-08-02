@@ -1,0 +1,16 @@
+{
+	"name": "thelounge-plugin-seedrpg-gathering",
+	"version": "0.6.0",
+	"description": "Queue and time SeedRPG gathering activities from The Lounge",
+	"main": "index.js",
+	"keywords": [
+		"thelounge",
+		"thelounge-plugin"
+	],
+	"thelounge": {
+		"name": "seedrpg-gathering",
+		"type": "plugin"
+	},
+	"license": "MIT",
+	"private": true
+}
