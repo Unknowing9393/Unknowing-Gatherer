@@ -17,6 +17,11 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.18.1 "daily now" runs the cycle immediately, any time, without waiting
+ *          for the scheduled UTC slot.
+ *   0.18.0 !recall now costs a consumable, so it is only used when the route
+ *          from home beats the route from the current position by enough --
+ *          configurable with "daily recall <pct>" (default 25%).
  *   0.17.0 When no shorter route exists: report the best available option and
  *          offer ignore budget|travel|minimum, or adapt to re-divide the
  *          window from travel measured during the run.
@@ -83,7 +88,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.17.0";
+const VERSION = "0.18.1";
 
 const fs = require("fs");
 const path = require("path");
