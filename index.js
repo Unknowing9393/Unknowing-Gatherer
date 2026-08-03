@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.18.1
+ * thelounge-plugin-seedrpg-gathering  v0.18.2
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -17,6 +17,7 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.18.2 "daily now" also accepts "start" as an alias.
  *   0.18.1 "daily now" runs the cycle immediately, any time, without waiting
  *          for the scheduled UTC slot.
  *   0.18.0 !recall now costs a consumable, so it is only used when the route
@@ -88,7 +89,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.18.1";
+const VERSION = "0.18.2";
 
 const fs = require("fs");
 const path = require("path");
@@ -2833,7 +2834,7 @@ module.exports = {
 							break;
 						}
 
-						if (/^(now|run)$/i.test(arg)) {
+						if (/^(now|run|start)$/i.test(arg)) {
 							if (!s.daily.enabled) {
 								s.say(`No daily cycle set. Configure one first, e.g. ${CMD} daily all for 1h`);
 								break;
