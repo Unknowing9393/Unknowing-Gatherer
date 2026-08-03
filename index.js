@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.18.0
+ * thelounge-plugin-seedrpg-gathering  v0.18.1
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -687,7 +687,7 @@ class Session {
 		this.attached = false;
 		this.totals = {runs: 0, successes: 0, xp: 0, loot: new Map()};
 
-		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null, recallThreshold: null};
+		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null, recallThreshold: null, lastRunDay: null};
 		this.dailyTimer = null;
 		this.reminderTimer = null;
 		this.pendingWarnings = null;
@@ -1185,6 +1185,7 @@ class Session {
 			ignore: saved.ignore || null,
 			adapt: Boolean(saved.adapt),
 			recallThreshold: typeof saved.recallThreshold === "number" ? saved.recallThreshold : null,
+			lastRunDay: saved.lastRunDay || null,
 			plan: saved.plan || (saved.limit
 				? Object.fromEntries(Object.keys(ACTIVITIES).map((a) => [a, saved.limit]))
 				: null),
@@ -1223,6 +1224,7 @@ class Session {
 				ignore: this.daily.ignore || null,
 				adapt: Boolean(this.daily.adapt),
 				recallThreshold: typeof this.daily.recallThreshold === "number" ? this.daily.recallThreshold : null,
+				lastRunDay: this.daily.lastRunDay || null,
 				finishers: this.finishers,
 			};
 		} else {
@@ -1231,8 +1233,17 @@ class Session {
 		writeDailyStore(store);
 	}
 
+	/**
+	 * Next scheduled fire time. If today's slot was already run (including a
+	 * manual "daily now" sprung early), that slot is skipped so a still-armed
+	 * timer cannot fire the cycle a second time on the same UTC day.
+	 */
 	nextDailyAt() {
-		return nextUtcOccurrence(this.daily.atMin);
+		let next = nextUtcOccurrence(this.daily.atMin);
+		if (this.daily.lastRunDay && utcDay(next) === this.daily.lastRunDay) {
+			next = new Date(next.getTime() + 86400000);
+		}
+		return next;
 	}
 
 	/** Fraction of route travel that recalling home must save to be worth the item. */
@@ -1326,10 +1337,13 @@ class Session {
 			return;
 		}
 
+		this.daily.lastRunDay = utcDay();
+		this.persistDaily();
+
 		this.rotation = null;   // daily is a one-shot pass, not a loop
 		this.dailyRunActive = true;
 		this.dailyStartedAt = Date.now();
-		this.armDaily();        // schedule tomorrow before the work begins
+		this.armDaily();        // schedule the next slot before the work begins
 
 		// Recall home first so the route plans from a known origin -- but only
 		// if a teleport is actually held. Without one, !recall does nothing and
@@ -2424,6 +2438,7 @@ function helpLines() {
 		`  ${CMD} daily all for 1h, fish for 15m, hunt off`,
 		`  ${CMD} daily mine for 90m, chop for 90m at 02:00`,
 		`  ${CMD} daily                 show schedule and next run`,
+		`  ${CMD} daily now             run the cycle immediately, any time`,
 		`  ${CMD} daily accept          allow a schedule that was warned about`,
 		`  ${CMD} daily no              find a shorter route using closer nodes`,
 		`  ${CMD} daily options         best available route and ways to proceed`,
@@ -2810,6 +2825,20 @@ module.exports = {
 							s.clearReminders();
 							s.persistDaily();
 							s.say("Accepted -- the daily cycle will run as scheduled.");
+							break;
+						}
+
+						if (/^(now|run)$/i.test(arg)) {
+							if (!s.daily.enabled) {
+								s.say(`No daily cycle set. Configure one first, e.g. ${CMD} daily all for 1h`);
+								break;
+							}
+							if (s.current || s.queue.length) {
+								s.say(`Cannot start now -- work already in progress (${s.queue.length} queued).`);
+								break;
+							}
+							s.say("Starting the daily cycle now.");
+							s.fireDaily();
 							break;
 						}
 
