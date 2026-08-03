@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.17.0
+ * thelounge-plugin-seedrpg-gathering  v0.18.0
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -183,6 +183,11 @@ const CONFIG = {
 
 	// Gap between chained finisher commands.
 	finisherGapMs: 4000,
+
+	// Recalling home spends a consumable, so only do it when the route from
+	// home is at least this much shorter than the route from where we already
+	// are. Override per-network with "<cmd> daily recall <percent>".
+	recallSavingsThreshold: 0.25,
 
 	// Never allot less than this per stop when dividing a budget.
 	minShareMs: 5 * 60000,
@@ -682,7 +687,7 @@ class Session {
 		this.attached = false;
 		this.totals = {runs: 0, successes: 0, xp: 0, loot: new Map()};
 
-		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null};
+		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null, recallThreshold: null};
 		this.dailyTimer = null;
 		this.reminderTimer = null;
 		this.pendingWarnings = null;
@@ -1179,6 +1184,7 @@ class Session {
 			nodeOverrides: saved.nodeOverrides || null,
 			ignore: saved.ignore || null,
 			adapt: Boolean(saved.adapt),
+			recallThreshold: typeof saved.recallThreshold === "number" ? saved.recallThreshold : null,
 			plan: saved.plan || (saved.limit
 				? Object.fromEntries(Object.keys(ACTIVITIES).map((a) => [a, saved.limit]))
 				: null),
@@ -1216,6 +1222,7 @@ class Session {
 				nodeOverrides: this.daily.nodeOverrides || null,
 				ignore: this.daily.ignore || null,
 				adapt: Boolean(this.daily.adapt),
+				recallThreshold: typeof this.daily.recallThreshold === "number" ? this.daily.recallThreshold : null,
 				finishers: this.finishers,
 			};
 		} else {
@@ -1226,6 +1233,13 @@ class Session {
 
 	nextDailyAt() {
 		return nextUtcOccurrence(this.daily.atMin);
+	}
+
+	/** Fraction of route travel that recalling home must save to be worth the item. */
+	recallThreshold() {
+		return typeof this.daily.recallThreshold === "number"
+			? this.daily.recallThreshold
+			: CONFIG.recallSavingsThreshold;
 	}
 
 	clearReminders() {
@@ -1362,6 +1376,48 @@ class Session {
 
 			this.planDaily();
 			return;
+		}
+
+		// We hold a teleport (or can't confirm either way). Recalling spends
+		// the consumable, so only do it when the route from home is enough
+		// shorter than the route from where we already are; otherwise route
+		// from here and keep the item.
+		let current = null;
+		try {
+			current = await this.fetchPosition();
+		} catch (err) {
+			current = null;
+		}
+		const from = (current && current.coords) || this.lastPos;
+
+		if (from) {
+			let estCurrent = null, estHome = null;
+			try {
+				estCurrent = await this.estimateDaily(from);
+				estHome = await this.estimateDaily(this.home());
+			} catch (err) {
+				estCurrent = estHome = null;
+			}
+
+			if (estCurrent && estHome && estCurrent.estTravel > 0) {
+				const savings = (estCurrent.estTravel - estHome.estTravel) / estCurrent.estTravel;
+				const threshold = this.recallThreshold();
+
+				if (savings < threshold) {
+					this.say(
+						`Recall would cut travel by only ${Math.round(savings * 100)}% ` +
+						`(< ${Math.round(threshold * 100)}% threshold) -- ` +
+						`routing from current position ${from[0]},${from[1]} instead.`
+					);
+					this.planDaily();
+					return;
+				}
+
+				this.say(
+					`Recall cuts travel by ${Math.round(savings * 100)}% ` +
+					`(>= ${Math.round(threshold * 100)}% threshold) -- recalling home.`
+				);
+			}
 		}
 
 		if (stock === null) {
@@ -1848,6 +1904,7 @@ class Session {
 		return `Daily cycle on -- ${what}, at ${fmtUtc(this.daily.atMin)} ` +
 			`(next ${when.toISOString().slice(0, 16).replace("T", " ")} UTC, in ${fmt(inMs)})` +
 			(this.daily.adapt ? " | adaptive" : "") +
+			` | recall >= ${Math.round(this.recallThreshold() * 100)}% saved` +
 			(this.daily.ignore && Object.keys(this.daily.ignore).length
 				? ` | ignoring: ${Object.keys(this.daily.ignore).join(", ")}`
 				: "") +
@@ -2372,12 +2429,14 @@ function helpLines() {
 		`  ${CMD} daily options         best available route and ways to proceed`,
 		`  ${CMD} daily ignore budget|travel|minimum`,
 		`  ${CMD} daily adapt           re-divide the window as travel is measured`,
+		`  ${CMD} daily recall <pct>    only !recall if it saves >= pct% travel (default 25%)`,
 		"       Unaccepted schedules are reminded every 30m from 00:00 UTC.",
 		`  ${CMD} daily off             cancel`,
 		"       Each activity gets its own time; 'all' sets a baseline.",
 		"       'within' divides a wall-clock budget after estimating travel.",
 		"       The game day resets at 00:00 UTC; times are UTC.",
-		"       Starts with !recall + !home, then walks the shortest route.",
+		"       !recall costs a consumable, so it is only used when the route",
+		"       from home beats the route from where you are by enough (see recall above).",
 		`  ${CMD} after gauntlet 3      run something once gathering finishes`,
 		`  ${CMD} after waypoint 180 240 | dungeon 5    chain several`,
 		`  ${CMD} after clear           cancel post-cycle actions`,
@@ -2620,6 +2679,31 @@ module.exports = {
 							break;
 						}
 
+						if (/^recall\b/i.test(arg)) {
+							const what = arg.replace(/^recall\s*/i, "").trim().toLowerCase();
+
+							if (/^(default|reset|clear)$/.test(what)) {
+								s.daily.recallThreshold = null;
+								s.persistDaily();
+								s.say(`Recall threshold reset to default (${Math.round(CONFIG.recallSavingsThreshold * 100)}%).`);
+								break;
+							}
+
+							const m = what.match(/^(\d+(?:\.\d+)?)\s*%?$/);
+							const pct = m ? parseFloat(m[1]) : NaN;
+
+							if (!m || pct < 0 || pct > 100) {
+								s.say(`Usage: ${CMD} daily recall <percent>   e.g. ${CMD} daily recall 25   (or "default" to reset)`);
+								s.say(`Currently: ${Math.round(s.recallThreshold() * 100)}%`);
+								break;
+							}
+
+							s.daily.recallThreshold = pct / 100;
+							s.persistDaily();
+							s.say(`Recall threshold set to ${pct}% -- !recall is used only when it cuts route travel by at least that much.`);
+							break;
+						}
+
 						if (/^(adapt|adaptive)$/i.test(arg)) {
 							if (!s.daily.budget) {
 								s.say(`Adapt needs a budget -- set one with ${CMD} daily within 10h`);
@@ -2774,7 +2858,8 @@ module.exports = {
 						}
 
 						s.daily = {enabled: true, atMin, plan, budget, accepted: false,
-							nodeOverrides: null, ignore: null, adapt: false};
+							nodeOverrides: null, ignore: null, adapt: false,
+							recallThreshold: s.daily.recallThreshold};
 						s.persistDaily();
 						s.armDaily();
 						s.say(s.dailyStatus());
