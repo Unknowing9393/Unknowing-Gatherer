@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.18.2
+ * thelounge-plugin-seedrpg-gathering  v0.20.0
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -17,6 +17,10 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.20.0 "hardcore on|off": on [DEATH], reset home to SeedHaven, recall,
+ *          and re-equip once. Persists across restarts and self-attaches.
+ *   0.19.0 "daily nodes" previews the node each activity would use, and flags
+ *          level-eligible nodes whose position is still unmapped.
  *   0.18.2 "daily now" also accepts "start" as an alias.
  *   0.18.1 "daily now" runs the cycle immediately, any time, without waiting
  *          for the scheduled UTC slot.
@@ -89,7 +93,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.18.2";
+const VERSION = "0.20.0";
 
 const fs = require("fs");
 const path = require("path");
@@ -206,6 +210,9 @@ const CONFIG = {
 	// the UTC day rollover and the cycle's start time.
 	reminderEveryMs: 30 * 60000,
 
+	// Hardcore mode: town [DEATH] resets home to, before recalling there.
+	hardcoreHomeTown: "SeedHaven",
+
 	// NOTE: there are no stall guards anywhere. Neither travel nor gathering can
 	// stall, so any silence-based timeout would only ever fire falsely and kill
 	// a healthy run. Runs end on their limit, or when the user says so.
@@ -254,6 +261,13 @@ function parseLine(line) {
 	if (out.tag === "LEVEL UP") {
 		const lv = out.body.match(RE.levelUp);
 		if (lv) out.levelUp = {skill: lv[1], level: parseInt(lv[2], 10)};
+		return out;
+	}
+
+	// The game's own death signal. Matched on the tag, not on "you have died"
+	// text, so hardcore recovery never fires on an unrelated blocked line.
+	if (out.tag === "DEATH") {
+		out.death = true;
 		return out;
 	}
 
@@ -617,6 +631,7 @@ let API = null;
 const DAILY_FILE = "unkgather-daily.json";
 const MAP_FILE = "unkgather-nodes.json";
 const STATS_FILE = "unkgather-stats.json";
+const HARDCORE_FILE = "unkgather-hardcore.json";
 const STATS_KEEP_DAYS = 60;
 
 /** UTC date key -- the game day resets at 00:00 UTC, so days are UTC days. */
@@ -677,6 +692,14 @@ function writeDailyStore(obj) {
 	writeJson(DAILY_FILE, obj);
 }
 
+function readHardcoreStore() {
+	return readJson(HARDCORE_FILE, {});
+}
+
+function writeHardcoreStore(obj) {
+	writeJson(HARDCORE_FILE, obj);
+}
+
 class Session {
 	constructor(network, client, chanId) {
 		this.network = network;
@@ -690,6 +713,7 @@ class Session {
 		this.lastSend = 0;
 		this.halted = null;
 		this.debug = false;
+		this.hardcore = false;
 		this.attached = false;
 		this.totals = {runs: 0, successes: 0, xp: 0, loot: new Map()};
 
@@ -771,6 +795,14 @@ class Session {
 		if (p.levelUp) {
 			this.say(`Level up: ${p.levelUp.skill} -> ${p.levelUp.level}`);
 			this.levels.clear();   // re-query before the next auto pick
+			return;
+		}
+
+		if (p.death) {
+			this.halted = line;
+			if (this.current) this.stopCurrent(`halted: ${line}`);
+			this.say(this.hardcore ? `Death detected -- ${line}` : `Death detected -- ${line} (hardcore mode off, resume manually)`);
+			if (this.hardcore) this.hardcoreRecover();
 			return;
 		}
 
@@ -1237,6 +1269,31 @@ class Session {
 			delete store[this.dailyKey()];
 		}
 		writeDailyStore(store);
+	}
+
+	restoreHardcore() {
+		this.hardcore = Boolean(readHardcoreStore()[this.dailyKey()]);
+		return this.hardcore;
+	}
+
+	persistHardcore() {
+		const store = readHardcoreStore();
+		if (this.hardcore) store[this.dailyKey()] = true;
+		else delete store[this.dailyKey()];
+		writeHardcoreStore(store);
+	}
+
+	/**
+	 * Hardcore-mode recovery, run once per [DEATH]: reset home to a fixed town
+	 * (SeedHaven, away from whatever spot got us killed), recall there, then
+	 * re-equip. Does not resume the queue -- that still needs an explicit
+	 * "resume" so a death is never glossed over.
+	 */
+	hardcoreRecover() {
+		this.say(`Hardcore recovery: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest.`);
+		this.send(`!home ${CONFIG.hardcoreHomeTown}`);
+		setTimeout(() => this.send("!recall"), CONFIG.minGapMs);
+		setTimeout(() => this.send("!equipbest"), CONFIG.minGapMs + CONFIG.recallMs);
 	}
 
 	/**
@@ -2447,6 +2504,7 @@ function helpLines() {
 		`  ${CMD} daily now             run the cycle immediately, any time`,
 		`  ${CMD} daily accept          allow a schedule that was warned about`,
 		`  ${CMD} daily no              find a shorter route using closer nodes`,
+		`  ${CMD} daily nodes           node picked per activity, flags any unmapped`,
 		`  ${CMD} daily options         best available route and ways to proceed`,
 		`  ${CMD} daily ignore budget|travel|minimum`,
 		`  ${CMD} daily adapt           re-divide the window as travel is measured`,
@@ -2475,6 +2533,7 @@ function helpLines() {
 		`  ${CMD} skip                   abandon current run, start next`,
 		`  ${CMD} stop                   stop everything, clear queue`,
 		`  ${CMD} resume                 un-halt after a blocked state`,
+		`  ${CMD} hardcore on|off        on [DEATH]: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest`,
 		`  ${CMD} loot                   session totals (since last restart)`,
 		`  ${CMD} stats                  today's totals per activity`,
 		`  ${CMD} stats yesterday        also: week, all, days, YYYY-MM-DD`,
@@ -2506,6 +2565,13 @@ module.exports = {
 					if (s.restoreDaily()) {
 						s.say(`Restored: ${s.dailyStatus()}`);
 					}
+					if (s.restoreHardcore()) {
+						// Purely reactive to incoming PMs, with no timer of its own to
+						// self-attach on -- so unlike daily, it must attach right here.
+						s.say(s.attach()
+							? "Restored: hardcore death recovery on, watching PMs."
+							: "Restored: hardcore death recovery on, but could not attach the PM listener.");
+					}
 				}
 				s.client = client;
 				s.chanId = target.chan;
@@ -2517,7 +2583,7 @@ module.exports = {
 				// Anything that needs to READ DM's replies is useless without
 				// the listener. Silently queueing work that can never observe a
 				// result is worse than failing loudly, so attach on demand.
-				const NEEDS_LISTENER = ["q", "queue", "rotate", "nodes", "levels", "skip", "resume", "daily", "after"];
+				const NEEDS_LISTENER = ["q", "queue", "rotate", "nodes", "levels", "skip", "resume", "daily", "after", "hardcore"];
 				if (NEEDS_LISTENER.includes(sub) && !s.attached) {
 					if (!s.attach()) return;   // attach() already reported why
 					s.say(`Auto-attached (run ${CMD} on to do this explicitly).`);
@@ -2592,6 +2658,19 @@ module.exports = {
 						const v = (rest || "").toLowerCase();
 						if (v === "on" || v === "off") CONFIG.autoNode = v === "on";
 						s.say(`Auto node selection ${CONFIG.autoNode ? "on" : "off"}.`);
+						break;
+					}
+
+					case "hardcore": {
+						const v = (rest || "").toLowerCase();
+						if (v === "on" || v === "off") {
+							s.hardcore = v === "on";
+							s.persistHardcore();
+						}
+						s.say(`Hardcore death recovery ${s.hardcore ? "on" : "off"}` +
+							(s.hardcore
+								? ` -- on [DEATH]: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest.`
+								: "."));
 						break;
 					}
 
@@ -2801,6 +2880,40 @@ module.exports = {
 									s.say(`Still short of ${fmt(CONFIG.minGatherPerStopMs)} per stop. ` +
 										`${CMD} daily accept to run it anyway.`);
 								}
+							})();
+							break;
+						}
+
+						if (/^nodes$/i.test(arg)) {
+							if (!s.daily.enabled) {
+								s.say("No daily cycle set.");
+								break;
+							}
+							(async () => {
+								let est = null;
+								try {
+									est = await s.estimateDaily(s.lastPos || s.home());
+								} catch (err) {
+									est = null;
+								}
+
+								if (!est || (!est.ordered.length && !est.unmapped.length)) {
+									s.say("Could not resolve any nodes for the current plan.");
+									return;
+								}
+
+								const stepMs = s.stepMs();
+								est.ordered.forEach((st) => {
+									const leg = st.fromDist
+										? ` (+${fmt(travelEstimate(st.fromDist, stepMs).ms)} travel)`
+										: "";
+									s.say(`  ${st.act.padEnd(8)} ${st.node.name} (Lv${st.node.level}) @ ${st.pos[0]},${st.pos[1]}${leg}`);
+								});
+
+								est.unmapped.forEach((st) => {
+									s.say(`  ${st.act.padEnd(8)} ${st.node.name} (Lv${st.node.level}) -- ` +
+										`location unknown, visit once with ${CMD} q ${st.act} to map it`);
+								});
 							})();
 							break;
 						}
