@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.20.0
+ * thelounge-plugin-seedrpg-gathering  v0.21.0
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -17,6 +17,11 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.21.0 Travel time is now learned per node (real ms per coordinate unit
+ *          from actual trips) instead of assuming a fixed tiles-per-step
+ *          rate -- speed depends on region and road level (1-5 tiles/step
+ *          on roads, always 1 off-road), which no single constant can
+ *          represent. Unwalked legs fall back to the 1 tile/step worst case.
  *   0.20.0 "hardcore on|off": on [DEATH], reset home to SeedHaven, recall,
  *          and re-equip once. Persists across restarts and self-attaches.
  *   0.19.0 "daily nodes" previews the node each activity would use, and flags
@@ -93,7 +98,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.20.0";
+const VERSION = "0.21.0";
 
 const fs = require("fs");
 const path = require("path");
@@ -103,7 +108,7 @@ const path = require("path");
 // ---------------------------------------------------------------------------
 
 const ACTIVITIES = {
-	fish:    {noun: "spots", tag: "FISHING",     stat: "FSH", skill: "fishing"},
+	fish:    {noun: "nodes", tag: "FISHING",     stat: "FSH", skill: "fishing"},
 	mine:    {noun: "nodes", tag: "MINING",      stat: "MIN", skill: "mining"},
 	chop:    {noun: "nodes", tag: "WOODCUTTING", stat: "WDC", skill: "woodcutting"},
 	salvage: {noun: "nodes", tag: "SALVAGING",   stat: "SAL", skill: "salvaging"},
@@ -165,18 +170,22 @@ const CONFIG = {
 	// after the reset.
 	dailyDefaultUtcMinute: 5,
 
-	// Travel is grid movement: 3 coordinate units per step, and observed at
-	// ~67s per step. stepMs is refined from real runs as they complete.
-	mapUnitsPerStep: 3,
-	mapStepMs: 67000,
+	// Travel speed (ms per coordinate unit) depends on the region and road
+	// level along the way -- roads run anywhere from 1 to 5 tiles per ~67s
+	// step, and off-road is always 1 tile per step. There is no way to know a
+	// route's real speed without walking it, so each node's approach speed is
+	// learned from real runs (see rememberNode). This is only the
+	// conservative fallback for a node -- or leg -- never yet walked (worst
+	// case: 1 tile/step).
+	fallbackMsPerUnit: 67000,
 
 	// Fallback only. Home is normally read from the game with !home, which
 	// keeps working as more towns are discovered. Manual override:
 	// "<cmd> home <x>,<y>".
-	homeCoords: [180, 240],
+	homeCoords: [0, 500],
 
 	// Grace period after !recall before we start issuing gathering commands.
-	recallMs: 6000,
+	recallMs: 60000,
 
 	// Consumable that !recall spends. Matched case-insensitively against the
 	// !inv consumables listing.
@@ -213,9 +222,7 @@ const CONFIG = {
 	// Hardcore mode: town [DEATH] resets home to, before recalling there.
 	hardcoreHomeTown: "SeedHaven",
 
-	// NOTE: there are no stall guards anywhere. Neither travel nor gathering can
-	// stall, so any silence-based timeout would only ever fire falsely and kill
-	// a healthy run. Runs end on their limit, or when the user says so.
+
 };
 
 // ---------------------------------------------------------------------------
@@ -227,7 +234,7 @@ const CONFIG = {
 //   [LEVEL UP] Foraging reached level 4!  -  Nick reached microservice architecture of mind
 //
 // Flavor text is randomized and enormous, so we never match on it. A tick is a
-// success iff it carries +Nxp.
+// success if it carries +Nxp.
 // ---------------------------------------------------------------------------
 
 const RE = {
@@ -565,6 +572,7 @@ class Run {
 		this.travelSteps = 0;
 		this.travelStartedAt = 0;
 		this.travelMs = 0;
+		this.travelFrom = null;
 		this.coords = null;
 		this.startedAt = 0;
 		this.lastTick = 0;
@@ -678,10 +686,13 @@ function manhattan(a, b) {
 	return Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
 }
 
-/** Distance in coordinate units -> estimated travel time. */
-function travelEstimate(units, stepMs) {
-	const steps = Math.round(units / CONFIG.mapUnitsPerStep);
-	return {steps, ms: steps * (stepMs || CONFIG.mapStepMs)};
+/**
+ * Distance in coordinate units -> estimated travel time, given a ms/unit
+ * rate. Pass the destination node's own learned rate when known (see
+ * Session#nodeSpeed); falls back to the conservative worst case otherwise.
+ */
+function travelEstimate(units, msPerUnit) {
+	return {ms: Math.round(units * (msPerUnit || CONFIG.fallbackMsPerUnit))};
 }
 
 function readDailyStore() {
@@ -864,6 +875,7 @@ class Session {
 			run.confirmedNode = p.started.node;
 			run.travelStartedAt = Date.now();
 			run.lastProgress = Date.now();
+			run.travelFrom = this.lastPos;
 
 			const want = run.resolved && run.resolved.name;
 			const mismatch = want && want.toLowerCase() !== p.started.node.toLowerCase();
@@ -874,8 +886,6 @@ class Session {
 				` -- travelling`
 			);
 
-			// Travel is unbounded and cannot stall, so nothing is armed here.
-			// The run clock starts on arrival. /unkgather skip aborts manually.
 			return;
 		}
 
@@ -892,7 +902,7 @@ class Session {
 			// node lives. Learned once, reused to plan future routes.
 			if (run.coords && run.confirmedNode) {
 				this.rememberNode(run.activity, run.confirmedNode, run.coords,
-					run.travelSteps, run.travelMs);
+					run.travelSteps, run.travelMs, run.travelFrom);
 				this.lastPos = run.coords;
 			}
 			run.state = "running";
@@ -1058,7 +1068,6 @@ class Session {
 	mapStore() {
 		const m = readJson(MAP_FILE, null) || {};
 		if (!m.nodes) m.nodes = {};
-		if (!m.stats) m.stats = {stepMs: CONFIG.mapStepMs, samples: 0};
 		return m;
 	}
 
@@ -1066,12 +1075,27 @@ class Session {
 		return `${activity}|${String(nodeName).toLowerCase()}`;
 	}
 
-	/** Records where a node is, learned from the last coords before arrival. */
-	rememberNode(activity, nodeName, coords, steps, ms) {
+	/** Learned ms per coordinate unit for the approach to this node, if known. */
+	nodeSpeed(activity, nodeName) {
+		const e = this.mapStore().nodes[this.mapKey(activity, nodeName)];
+		return (e && e.msPerUnit) || null;
+	}
+
+	/**
+	 * Records where a node is, learned from the last coords before arrival.
+	 * When the trip's starting point is also known, this measures that
+	 * approach's real ms-per-tile directly from distance covered and time
+	 * taken -- travel speed depends on the region and road level along the
+	 * way (roads run 1-5 tiles per step, off-road always 1), so it must be
+	 * observed per node rather than assumed from one global constant.
+	 */
+	rememberNode(activity, nodeName, coords, steps, ms, from) {
 		if (!coords || !nodeName) return;
 
 		const m = this.mapStore();
-		m.nodes[this.mapKey(activity, nodeName)] = {
+		const key = this.mapKey(activity, nodeName);
+		const prev = m.nodes[key];
+		const entry = {
 			activity,
 			name: nodeName,
 			x: coords[0],
@@ -1079,13 +1103,22 @@ class Session {
 			seen: new Date().toISOString(),
 		};
 
-		// Refine the per-step time from real observations.
-		if (steps > 2 && ms > 0) {
-			const prev = m.stats.stepMs || CONFIG.mapStepMs;
-			const n = m.stats.samples || 0;
-			m.stats.stepMs = Math.round((prev * n + ms / steps) / (n + 1));
-			m.stats.samples = n + 1;
+		if (prev && prev.msPerUnit) {
+			entry.msPerUnit = prev.msPerUnit;
+			entry.samples = prev.samples || 1;
 		}
+
+		// A short trip (few steps) is too noisy to trust, so it is recorded
+		// but not used to refine the speed estimate.
+		const dist = from ? manhattan(from, coords) : 0;
+		if (steps > 2 && dist > 0 && ms > 0) {
+			const rate = ms / dist;
+			const n = entry.samples || 0;
+			entry.msPerUnit = Math.round(((entry.msPerUnit || rate) * n + rate) / (n + 1));
+			entry.samples = n + 1;
+		}
+
+		m.nodes[key] = entry;
 
 		writeJson(MAP_FILE, m);
 	}
@@ -1166,10 +1199,6 @@ class Session {
 	nodePos(activity, nodeName) {
 		const e = this.mapStore().nodes[this.mapKey(activity, nodeName)];
 		return e ? [e.x, e.y] : null;
-	}
-
-	stepMs() {
-		return this.mapStore().stats.stepMs || CONFIG.mapStepMs;
 	}
 
 	/**
@@ -1557,10 +1586,9 @@ class Session {
 	routeCost(choice, from) {
 		const stops = Object.entries(choice).map(([act, node]) => ({act, node, pos: node.pos}));
 		const ordered = this.orderByProximity(stops, from);
-		const stepMs = this.stepMs();
 		let ms = 0;
 		for (const st of ordered) {
-			if (st.fromDist) ms += travelEstimate(st.fromDist, stepMs).ms;
+			if (st.fromDist) ms += travelEstimate(st.fromDist, this.nodeSpeed(st.act, st.node.name)).ms;
 		}
 		return {ms, ordered};
 	}
@@ -1694,13 +1722,12 @@ class Session {
 		const planned = mappedStops.length ? mappedStops : stops;
 
 		const ordered = this.orderByProximity(planned, from);
-		const stepMs = this.stepMs();
 
 		let travelMs = 0;
 		let knownLegs = 0;
 		for (const st of ordered) {
 			if (st.fromDist) {
-				travelMs += travelEstimate(st.fromDist, stepMs).ms;
+				travelMs += travelEstimate(st.fromDist, this.nodeSpeed(st.act, st.node.name)).ms;
 				knownLegs++;
 			}
 		}
@@ -1893,11 +1920,9 @@ class Session {
 			this.pendingSummary = null;
 			this.clearReminders();
 		}
-		const stepMs = this.stepMs();
-
 		let travelMs = 0;
 		for (const st of ordered) {
-			if (st.fromDist) travelMs += travelEstimate(st.fromDist, stepMs).ms;
+			if (st.fromDist) travelMs += travelEstimate(st.fromDist, this.nodeSpeed(st.act, st.node.name)).ms;
 		}
 
 		const mapped = ordered.filter((s) => s.pos).length;
@@ -2130,12 +2155,14 @@ class Session {
 		const remainingBudget = this.daily.budget - elapsed;
 
 		// Estimate the travel still ahead from the map.
-		const stepMs = this.stepMs();
 		let cur = this.lastPos;
 		let travelAhead = 0;
 		for (const run of this.queue) {
-			const pos = this.nodePos(run.activity, run.confirmedNode || run.node);
-			if (cur && pos) travelAhead += travelEstimate(manhattan(cur, pos), stepMs).ms;
+			const nodeName = run.confirmedNode || run.node;
+			const pos = this.nodePos(run.activity, nodeName);
+			if (cur && pos) {
+				travelAhead += travelEstimate(manhattan(cur, pos), this.nodeSpeed(run.activity, nodeName)).ms;
+			}
 			if (pos) cur = pos;
 		}
 
@@ -2475,70 +2502,70 @@ function helpLines() {
 		`${PLUGIN_NAME} v${VERSION} -- ${CMD} (alias /${ALIASES[0]})`,
 		"",
 		"SETUP",
-		`  ${CMD} on                     watch PMs from ${CONFIG.botNick}`,
-		`  ${CMD} off                    stop watching, cancel any run`,
-		`  ${CMD} status                 what is running right now`,
+		`  ${CMD} on                     :watch PMs from ${CONFIG.botNick}`,
+		`  ${CMD} off                    :stop watching, cancel any run`,
+		`  ${CMD} status                 :what is running right now`,
 		"",
 		`QUEUE  -- a run is: <${acts}> [node] <limit>`,
 		"       where limit is: for <time> | x<N> hits | until <N>xp",
-		`  ${CMD} q forage for 10m       forage ten minutes, node auto-picked`,
-		`  ${CMD} q mine x25             mine until 25 successful actions`,
-		`  ${CMD} q chop until 500xp     chop until 500xp gained`,
-		`  ${CMD} q fish 1 for 1h30m     fish node 1 for an hour and a half`,
+		`  ${CMD} q forage for 10m       :forage ten minutes, node auto-picked`,
+		`  ${CMD} q mine x25             :mine until 25 successful actions`,
+		`  ${CMD} q chop until 500xp     :chop until 500xp gained`,
+		`  ${CMD} q fish 1 for 1h30m     :fish node 1 for an hour and a half`,
 		"",
 		"  Queued runs happen one after another, then the queue empties.",
 		"  To repeat them endlessly instead, separate runs with | and use rotate:",
 		`  ${CMD} rotate forage for 10m | mine x25 | chop for 5m`,
 		"       forage 10m, then mine 25 hits, then chop 5m, then start over.",
 		"",
-		`  ${CMD} list                   show what is running and queued`,
-		`  ${CMD} clear                  empty queue and stop any rotation`,
+		`  ${CMD} list                   :show what is running and queued`,
+		`  ${CMD} clear                  :empty queue and stop any rotation`,
 		"",
 		"DAILY  -- run every gathering skill once a day, unattended",
-		`  ${CMD} daily within 10h      fit everything in 10h, travel included`,
-		`  ${CMD} daily within 10h, fish off`,
-		`  ${CMD} daily all for 1h      one hour of every activity`,
-		`  ${CMD} daily all for 1h, fish for 15m, hunt off`,
-		`  ${CMD} daily mine for 90m, chop for 90m at 02:00`,
-		`  ${CMD} daily                 show schedule and next run`,
-		`  ${CMD} daily now             run the cycle immediately, any time`,
-		`  ${CMD} daily accept          allow a schedule that was warned about`,
-		`  ${CMD} daily no              find a shorter route using closer nodes`,
-		`  ${CMD} daily nodes           node picked per activity, flags any unmapped`,
-		`  ${CMD} daily options         best available route and ways to proceed`,
-		`  ${CMD} daily ignore budget|travel|minimum`,
-		`  ${CMD} daily adapt           re-divide the window as travel is measured`,
-		`  ${CMD} daily recall <pct>    only !recall if it saves >= pct% travel (default 25%)`,
+		`  ${CMD} daily within 10h      :fit everything in 10h, travel included`,
+		`  ${CMD} daily within 10h, fish off :fit everthing in 10h, travel included, fishing is skipped`,
+		`  ${CMD} daily all for 1h      :one hour of every activity`,
+		`  ${CMD} daily all for 1h, fish for 15m, hunt off :one hour of every activity, but fishing is limited to 15m and hunting is skipped`,
+		`  ${CMD} daily mine for 90m, chop for 90m at 02:00 :only mining and chopping is performed and for 90min each at 02:00`,
+		`  ${CMD} daily                 :show schedule and next run`,
+		`  ${CMD} daily now             :run the cycle immediately, any time`,
+		`  ${CMD} daily accept          :allow a schedule that was warned about`,
+		`  ${CMD} daily no              :find a shorter route using closer nodes`,
+		`  ${CMD} daily nodes           :node picked per activity, flags any unmapped`,
+		`  ${CMD} daily options         :best available route and ways to proceed`,
+		`  ${CMD} daily ignore budget|travel|minimum :override options`,
+		`  ${CMD} daily adapt           :re-divide the window as travel is measured`,
+		`  ${CMD} daily recall <pct>    :only !recall if it saves >= pct% travel (default 25%)`,
 		"       Unaccepted schedules are reminded every 30m from 00:00 UTC.",
-		`  ${CMD} daily off             cancel`,
+		`  ${CMD} daily off             :cancel`,
 		"       Each activity gets its own time; 'all' sets a baseline.",
 		"       'within' divides a wall-clock budget after estimating travel.",
 		"       The game day resets at 00:00 UTC; times are UTC.",
 		"       !recall costs a consumable, so it is only used when the route",
 		"       from home beats the route from where you are by enough (see recall above).",
-		`  ${CMD} after gauntlet 3      run something once gathering finishes`,
-		`  ${CMD} after waypoint 180 240 | dungeon 5    chain several`,
-		`  ${CMD} after clear           cancel post-cycle actions`,
-		`  ${CMD} map                   learned node positions and travel times`,
-		`  ${CMD} home                  read home town from the game (!home)`,
-		`  ${CMD} home <x>,<y>          override it manually`,
+		`  ${CMD} after gauntlet 3      :run something once gathering finishes, the options are waypoint, gauntlet ran as solo or dungeon`,
+		`  ${CMD} after waypoint 180 240 | dungeon 5    :chain several`,
+		`  ${CMD} after clear           :cancel post-cycle actions`,
+		`  ${CMD} map                   :learned node positions and travel times`,
+		`  ${CMD} home                  :read home town from the game (!home)`,
+		`  ${CMD} home <x>,<y>          :override it manually`,
 		"",
 		"NODES",
-		`  ${CMD} nodes <activity>       list nodes, * = your level allows it`,
-		`  ${CMD} levels                 your skill levels`,
-		`  ${CMD} auto on|off            auto-pick highest usable node (default on)`,
-		`  ${CMD} refresh                clear cached levels and node lists`,
+		`  ${CMD} nodes <activity>       :list nodes, * = your level allows it`,
+		`  ${CMD} levels                 :your skill levels`,
+		`  ${CMD} auto on|off            :auto-pick highest usable node (default on)`,
+		`  ${CMD} refresh                :clear cached levels and node lists`,
 		"",
 		"CONTROL",
-		`  ${CMD} skip                   abandon current run, start next`,
-		`  ${CMD} stop                   stop everything, clear queue`,
-		`  ${CMD} resume                 un-halt after a blocked state`,
-		`  ${CMD} hardcore on|off        on [DEATH]: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest`,
-		`  ${CMD} loot                   session totals (since last restart)`,
-		`  ${CMD} stats                  today's totals per activity`,
-		`  ${CMD} stats yesterday        also: week, all, days, YYYY-MM-DD`,
-		`  ${CMD} debug                  echo every DM line with its parse`,
-		`  ${CMD} help                   this list`,
+		`  ${CMD} skip                   :abandon current run, start next`,
+		`  ${CMD} stop                   :stop everything, clear queue`,
+		`  ${CMD} resume                 :un-halt after a blocked state`,
+		`  ${CMD} hardcore on|off        :on [DEATH]: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest`,
+		`  ${CMD} loot                   :session totals (since last restart)`,
+		`  ${CMD} stats                  :today's totals per activity`,
+		`  ${CMD} stats yesterday        :also: week, all, days, YYYY-MM-DD`,
+		`  ${CMD} debug                  :echo every DM line with its parse`,
+		`  ${CMD} help                   :this list`,
 		"",
 		"Time formats: 45s, 10m, 1h30m, 04:30.  Node names with spaces are fine.",
 	];
@@ -2902,10 +2929,9 @@ module.exports = {
 									return;
 								}
 
-								const stepMs = s.stepMs();
 								est.ordered.forEach((st) => {
 									const leg = st.fromDist
-										? ` (+${fmt(travelEstimate(st.fromDist, stepMs).ms)} travel)`
+										? ` (+${fmt(travelEstimate(st.fromDist, s.nodeSpeed(st.act, st.node.name)).ms)} travel)`
 										: "";
 									s.say(`  ${st.act.padEnd(8)} ${st.node.name} (Lv${st.node.level}) @ ${st.pos[0]},${st.pos[1]}${leg}`);
 								});
@@ -3149,15 +3175,16 @@ module.exports = {
 							s.say("No nodes mapped yet -- positions are learned as you travel to them.");
 							break;
 						}
-						s.say(`${keys.length} nodes mapped, ~${Math.round(s.stepMs() / 1000)}s/step ` +
-							`(${m.stats.samples} sample${m.stats.samples === 1 ? "" : "s"})` +
+						const timed = keys.map((k) => m.nodes[k]).filter((n) => n.msPerUnit);
+						s.say(`${keys.length} nodes mapped, ${timed.length} with a measured travel speed` +
 							(s.lastPos ? ` | you are near ${s.lastPos[0]},${s.lastPos[1]}` : ""));
 						keys.map((k) => m.nodes[k])
 							.sort((a, b) => a.activity.localeCompare(b.activity))
 							.forEach((n) => {
 								const d = s.lastPos ? manhattan(s.lastPos, [n.x, n.y]) : null;
 								const eta = d === null ? "" :
-									`  ~${fmt(travelEstimate(d, s.stepMs()).ms)} away`;
+									`  ~${fmt(travelEstimate(d, n.msPerUnit).ms)} away` +
+									(n.msPerUnit ? "" : " (unmeasured, worst case)");
 								s.say(`  !${n.activity.padEnd(8)} ${n.name} @ ${n.x},${n.y}${eta}`);
 							});
 						break;
