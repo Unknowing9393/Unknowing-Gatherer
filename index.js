@@ -1510,9 +1510,11 @@ class Session {
 				const threshold = this.recallThreshold();
 
 				if (savings < threshold) {
+					const desc = savings < 0
+						? `would increase travel by ${Math.round(-savings * 100)}%`
+						: `cuts travel by only ${Math.round(savings * 100)}% (< ${Math.round(threshold * 100)}% threshold)`;
 					this.say(
-						`Recall would cut travel by only ${Math.round(savings * 100)}% ` +
-						`(< ${Math.round(threshold * 100)}% threshold) -- ` +
+						`Recall ${desc} -- ` +
 						`routing from current position ${from[0]},${from[1]} instead.`
 					);
 					this.planDaily();
