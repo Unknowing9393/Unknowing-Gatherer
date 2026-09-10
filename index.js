@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.21.0
+ * thelounge-plugin-seedrpg-gathering  v0.24.0
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -17,6 +17,20 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.24.0 Hardcore recovery is now on by default and only fires for a death
+ *          actually carrying the game's own [HARDCORE] tag (equipped items
+ *          scattered to a dungeon) -- a normal death still halts the queue
+ *          but no longer needs "hardcore on" to have ever been run.
+ *          "hardcore off" opts back out. Every [DEATH], hardcore or not,
+ *          still halts and requires an explicit "resume".
+ *   0.23.0 "!equipbest" now always runs at the very end of the daily cycle,
+ *          after any safety deposit/recall and before configured "after"
+ *          actions, so gear is optimal regardless of where the day ends.
+ *   0.22.0 "after deposit" secures loot once the queue drains. If the day's
+ *          last node's level outguns SUR (from !stats) by more than the
+ *          safety margin, a deposit + unconditional recall now run
+ *          automatically first, before any configured "after" actions --
+ *          configurable with "daily safety <levels>" (default 5).
  *   0.21.0 Travel time is now learned per node (real ms per coordinate unit
  *          from actual trips) instead of assuming a fixed tiles-per-step
  *          rate -- speed depends on region and road level (1-5 tiles/step
@@ -98,7 +112,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.21.0";
+const VERSION = "0.24.0";
 
 const fs = require("fs");
 const path = require("path");
@@ -198,10 +212,26 @@ const CONFIG = {
 		// Unattended runs are always solo -- no group to coordinate with.
 		gauntlet: (arg) => (arg ? `!gauntlet ${arg} solo` : "!gauntlet solo"),
 		dungeon: (arg) => (arg ? `!queue dungeon ${arg}` : "!queue dungeon"),
+		// Secures loot before any post-cycle idling near mobs that could kill
+		// and drop it -- put this first in the chain (e.g. "after deposit | waypoint town").
+		deposit: () => "!deposit",
+		// Not user-facing (not in parseFinisher) -- only used internally by the
+		// SUR safety check below, which needs an unconditional recall rather
+		// than the savings-gated one used before the daily cycle starts.
+		recall: () => "!recall",
+		// Not user-facing either -- always appended at cycle end (see
+		// runFinishers) so gear is optimal regardless of where the day ends.
+		equipbest: () => "!equipbest",
 	},
 
 	// Gap between chained finisher commands.
 	finisherGapMs: 4000,
+
+	// If the last node gathered from today is more than this many levels above
+	// SUR (from !stats), its mobs are assumed too dangerous to linger near, so
+	// the cycle deposits loot and recalls home before any configured "after"
+	// actions run. Base guess -- widen or narrow as real risk becomes clearer.
+	survivalSafetyMargin: 5,
 
 	// Recalling home spends a consumable, so only do it when the route from
 	// home is at least this much shorter than the route from where we already
@@ -272,9 +302,14 @@ function parseLine(line) {
 	}
 
 	// The game's own death signal. Matched on the tag, not on "you have died"
-	// text, so hardcore recovery never fires on an unrelated blocked line.
+	// text, so hardcore recovery never fires on an unrelated blocked line. A
+	// normal death and a hardcore one both carry [DEATH]; only a hardcore
+	// death also carries a separate [HARDCORE] tag inline in the body, e.g.
+	// "You were slain by X! [HARDCORE] Lost ... Your N equipped items were
+	// scattered to a dungeon." -- that inline tag is what actually matters.
 	if (out.tag === "DEATH") {
 		out.death = true;
+		out.hardcoreDeath = /\[HARDCORE\]/.test(out.body);
 		return out;
 	}
 
@@ -483,11 +518,16 @@ function parseStatsLine(line) {
 	const act = body.match(/\bHP\s*:\s*\d+\s*\/\s*\d+\s*\|\s*([A-Za-z]+)\s*\|/);
 	const doing = act ? act[1].toLowerCase() : null;
 
+	// Core stat block, e.g. "OFF:9 DEF:10 EXP:9 SUR:10 LCK:9" -- SUR is used
+	// as the yardstick for what combat a node's mobs can be handled at.
+	const sur = body.match(/\bSUR\s*:\s*(\d+)/i);
+
 	return {
 		coords: pos ? [parseInt(pos[1], 10), parseInt(pos[2], 10)] : null,
 		hp: hp ? [parseInt(hp[1], 10), parseInt(hp[2], 10)] : null,
 		activity: doing,
 		online: /\bonline\b/i.test(body),
+		sur: sur ? parseInt(sur[1], 10) : null,
 	};
 }
 
@@ -724,17 +764,18 @@ class Session {
 		this.lastSend = 0;
 		this.halted = null;
 		this.debug = false;
-		this.hardcore = false;
+		this.hardcore = true;   // on by default -- only a [HARDCORE] death acts on it; "hardcore off" opts out
 		this.attached = false;
 		this.totals = {runs: 0, successes: 0, xp: 0, loot: new Map()};
 
-		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null, recallThreshold: null, lastRunDay: null};
+		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null, recallThreshold: null, survivalMargin: null, lastRunDay: null};
 		this.dailyTimer = null;
 		this.reminderTimer = null;
 		this.pendingWarnings = null;
 		this.pendingSummary = null;
 
 		this.lastPos = null;   // most recent coordinates seen
+		this.lastNodeLevel = null;   // level of the last node a run was sent to
 		this.finishers = [];   // [{kind, arg}] run after the daily cycle
 
 		this.levels = new Map();     // skill -> {level, at}
@@ -812,8 +853,19 @@ class Session {
 		if (p.death) {
 			this.halted = line;
 			if (this.current) this.stopCurrent(`halted: ${line}`);
-			this.say(this.hardcore ? `Death detected -- ${line}` : `Death detected -- ${line} (hardcore mode off, resume manually)`);
-			if (this.hardcore) this.hardcoreRecover();
+
+			// A normal death changes nothing beyond the halt above -- only a
+			// [HARDCORE] death (which scatters equipped gear to a dungeon)
+			// warrants automatic recovery, and even that only unless the user
+			// has explicitly turned it off (see hardcoreRecover/CONFIG.hardcore).
+			if (p.hardcoreDeath) {
+				this.say(this.hardcore
+					? `Hardcore death detected -- ${line}`
+					: `Hardcore death detected -- ${line} (recovery off, resume manually)`);
+				if (this.hardcore) this.hardcoreRecover();
+			} else {
+				this.say(`Death detected -- ${line} (not hardcore, resume manually)`);
+			}
 			return;
 		}
 
@@ -944,14 +996,47 @@ class Session {
 	/**
 	 * Issues the configured post-cycle actions once the queue drains. Only
 	 * fires for a daily cycle, so ad-hoc queues are unaffected.
+	 *
+	 * Before those, checks whether the last node worked today outguns SUR by
+	 * more than the safety margin -- if so, a deposit and an unconditional
+	 * recall are inserted first, so lingering mobs cannot cost loot or a life.
 	 */
-	runFinishers() {
-		if (!this.dailyRunActive || !this.finishers.length) return;
+	async runFinishers() {
+		if (!this.dailyRunActive) return;
 		this.dailyRunActive = false;
 
-		this.say(`Gathering done -- starting: ${this.finishers.map(describeFinisher).join(", ")}`);
+		const pre = [];
+		if (typeof this.lastNodeLevel === "number") {
+			let st = null;
+			try {
+				st = await this.fetchPosition();
+			} catch (err) {
+				st = null;
+			}
 
-		this.finishers.forEach((f, i) => {
+			if (st && typeof st.sur === "number") {
+				const margin = this.survivalMargin();
+				const cap = st.sur + margin;
+				if (this.lastNodeLevel > cap) {
+					this.say(
+						`Finished on a Lv${this.lastNodeLevel} node vs SUR ${st.sur} ` +
+						`(+${margin} cap ${cap}) -- depositing and recalling first.`
+					);
+					pre.push({kind: "deposit", arg: null}, {kind: "recall", arg: null});
+				}
+			}
+		}
+
+		// Always re-equip best gear at the end of the cycle, regardless of
+		// where the day ends up or whether it was flagged risky.
+		pre.push({kind: "equipbest", arg: null});
+
+		const chain = pre.concat(this.finishers);
+		if (!chain.length) return;
+
+		this.say(`Gathering done -- starting: ${chain.map(describeFinisher).join(", ")}`);
+
+		chain.forEach((f, i) => {
 			setTimeout(() => {
 				const build = CONFIG.finishers[f.kind];
 				if (build) this.send(build(f.arg));
@@ -1252,6 +1337,7 @@ class Session {
 			ignore: saved.ignore || null,
 			adapt: Boolean(saved.adapt),
 			recallThreshold: typeof saved.recallThreshold === "number" ? saved.recallThreshold : null,
+			survivalMargin: typeof saved.survivalMargin === "number" ? saved.survivalMargin : null,
 			lastRunDay: saved.lastRunDay || null,
 			plan: saved.plan || (saved.limit
 				? Object.fromEntries(Object.keys(ACTIVITIES).map((a) => [a, saved.limit]))
@@ -1291,6 +1377,7 @@ class Session {
 				ignore: this.daily.ignore || null,
 				adapt: Boolean(this.daily.adapt),
 				recallThreshold: typeof this.daily.recallThreshold === "number" ? this.daily.recallThreshold : null,
+				survivalMargin: typeof this.daily.survivalMargin === "number" ? this.daily.survivalMargin : null,
 				lastRunDay: this.daily.lastRunDay || null,
 				finishers: this.finishers,
 			};
@@ -1300,15 +1387,20 @@ class Session {
 		writeDailyStore(store);
 	}
 
+	/**
+	 * Hardcore recovery defaults to on -- an explicit "hardcore off" is the
+	 * only way to disable it, so an entry missing from the store (never
+	 * configured) must read as on, not off.
+	 */
 	restoreHardcore() {
-		this.hardcore = Boolean(readHardcoreStore()[this.dailyKey()]);
+		const saved = readHardcoreStore()[this.dailyKey()];
+		this.hardcore = typeof saved === "boolean" ? saved : true;
 		return this.hardcore;
 	}
 
 	persistHardcore() {
 		const store = readHardcoreStore();
-		if (this.hardcore) store[this.dailyKey()] = true;
-		else delete store[this.dailyKey()];
+		store[this.dailyKey()] = this.hardcore;
 		writeHardcoreStore(store);
 	}
 
@@ -1343,6 +1435,13 @@ class Session {
 		return typeof this.daily.recallThreshold === "number"
 			? this.daily.recallThreshold
 			: CONFIG.recallSavingsThreshold;
+	}
+
+	/** Levels above SUR a finishing node can run before it's treated as too dangerous to linger near. */
+	survivalMargin() {
+		return typeof this.daily.survivalMargin === "number"
+			? this.daily.survivalMargin
+			: CONFIG.survivalSafetyMargin;
 	}
 
 	clearReminders() {
@@ -1978,9 +2077,11 @@ class Session {
 			return a + (l.kind === "time" ? l.value : 0);
 		}, 0);
 
-		this.queue = ordered.map(
-			(st) => new Run(st.act, st.node.id || st.node.name, Object.assign({}, limitFor(st.act)))
-		);
+		this.queue = ordered.map((st) => {
+			const run = new Run(st.act, st.node.id || st.node.name, Object.assign({}, limitFor(st.act)));
+			run.resolved = st.node;
+			return run;
+		});
 
 		this.say(
 			`Daily cycle: ${ordered.length} stops -- ` +
@@ -2009,6 +2110,7 @@ class Session {
 			`(next ${when.toISOString().slice(0, 16).replace("T", " ")} UTC, in ${fmt(inMs)})` +
 			(this.daily.adapt ? " | adaptive" : "") +
 			` | recall >= ${Math.round(this.recallThreshold() * 100)}% saved` +
+			` | safety SUR +${this.survivalMargin()}` +
 			(this.daily.ignore && Object.keys(this.daily.ignore).length
 				? ` | ignoring: ${Object.keys(this.daily.ignore).join(", ")}`
 				: "") +
@@ -2270,6 +2372,10 @@ class Session {
 		this.say(run.summary());
 		this.recordRun(run);
 
+		if (run.resolved && typeof run.resolved.level === "number") {
+			this.lastNodeLevel = run.resolved.level;
+		}
+
 		this.totals.runs++;
 		this.totals.successes += run.successes;
 		this.totals.xp += run.xp;
@@ -2456,13 +2562,14 @@ function parseFinisher(text) {
 	const t = String(text).trim();
 	if (!t) return null;
 
-	const m = t.match(/^(waypoint|wp|gauntlet|gaunt|dungeon|dg)\b\s*(.*)$/i);
+	const m = t.match(/^(waypoint|wp|gauntlet|gaunt|dungeon|dg|deposit|dep)\b\s*(.*)$/i);
 	if (!m) return null;
 
 	const alias = m[1].toLowerCase();
 	const kind = alias === "wp" ? "waypoint"
 		: alias === "gaunt" ? "gauntlet"
 		: alias === "dg" ? "dungeon"
+		: alias === "dep" ? "deposit"
 		: alias;
 
 	let arg = m[2].trim();
@@ -2538,6 +2645,7 @@ function helpLines() {
 		`  ${CMD} daily ignore budget|travel|minimum :override options`,
 		`  ${CMD} daily adapt           :re-divide the window as travel is measured`,
 		`  ${CMD} daily recall <pct>    :only !recall if it saves >= pct% travel (default 25%)`,
+		`  ${CMD} daily safety <levels> :deposit + recall if the finishing node's Lv exceeds SUR + levels (default 5)`,
 		"       Unaccepted schedules are reminded every 30m from 00:00 UTC.",
 		`  ${CMD} daily off             :cancel`,
 		"       Each activity gets its own time; 'all' sets a baseline.",
@@ -2545,8 +2653,8 @@ function helpLines() {
 		"       The game day resets at 00:00 UTC; times are UTC.",
 		"       !recall costs a consumable, so it is only used when the route",
 		"       from home beats the route from where you are by enough (see recall above).",
-		`  ${CMD} after gauntlet 3      :run something once gathering finishes, the options are waypoint, gauntlet ran as solo or dungeon`,
-		`  ${CMD} after waypoint 180 240 | dungeon 5    :chain several`,
+		`  ${CMD} after gauntlet 3      :run something once gathering finishes, the options are waypoint, gauntlet ran as solo, dungeon, or deposit`,
+		`  ${CMD} after deposit | waypoint 180 240 | dungeon 5    :chain several`,
 		`  ${CMD} after clear           :cancel post-cycle actions`,
 		`  ${CMD} map                   :learned node positions and travel times`,
 		`  ${CMD} home                  :read home town from the game (!home)`,
@@ -2562,7 +2670,7 @@ function helpLines() {
 		`  ${CMD} skip                   :abandon current run, start next`,
 		`  ${CMD} stop                   :stop everything, clear queue`,
 		`  ${CMD} resume                 :un-halt after a blocked state`,
-		`  ${CMD} hardcore on|off        :on [DEATH]: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest`,
+		`  ${CMD} hardcore on|off        :on a [HARDCORE] death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest (on by default)`,
 		`  ${CMD} loot                   :session totals (since last restart)`,
 		`  ${CMD} stats                  :today's totals per activity`,
 		`  ${CMD} stats yesterday        :also: week, all, days, YYYY-MM-DD`,
@@ -2594,12 +2702,18 @@ module.exports = {
 					if (s.restoreDaily()) {
 						s.say(`Restored: ${s.dailyStatus()}`);
 					}
+					const savedHardcore = readHardcoreStore()[key];
 					if (s.restoreHardcore()) {
 						// Purely reactive to incoming PMs, with no timer of its own to
 						// self-attach on -- so unlike daily, it must attach right here.
+						// Hardcore recovery defaults to on, so this fires even with no
+						// prior config -- word it as a restore only when one exists.
+						const label = savedHardcore === true
+							? "Restored: hardcore death recovery on"
+							: "Hardcore death recovery on by default (\"" + CMD + " hardcore off\" to disable)";
 						s.say(s.attach()
-							? "Restored: hardcore death recovery on, watching PMs."
-							: "Restored: hardcore death recovery on, but could not attach the PM listener.");
+							? `${label}, watching PMs.`
+							: `${label}, but could not attach the PM listener.`);
 					}
 				}
 				s.client = client;
@@ -2696,10 +2810,10 @@ module.exports = {
 							s.hardcore = v === "on";
 							s.persistHardcore();
 						}
-						s.say(`Hardcore death recovery ${s.hardcore ? "on" : "off"}` +
+						s.say(`Hardcore death recovery ${s.hardcore ? "on" : "off"} (default: on)` +
 							(s.hardcore
-								? ` -- on [DEATH]: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest.`
-								: "."));
+								? ` -- on a [HARDCORE]-tagged death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest.`
+								: " -- a hardcore death will still halt the queue, but nothing recovers automatically."));
 						break;
 					}
 
@@ -2830,6 +2944,32 @@ module.exports = {
 							s.daily.recallThreshold = pct / 100;
 							s.persistDaily();
 							s.say(`Recall threshold set to ${pct}% -- !recall is used only when it cuts route travel by at least that much.`);
+							break;
+						}
+
+						if (/^safety\b/i.test(arg)) {
+							const what = arg.replace(/^safety\s*/i, "").trim().toLowerCase();
+
+							if (/^(default|reset|clear)$/.test(what)) {
+								s.daily.survivalMargin = null;
+								s.persistDaily();
+								s.say(`Safety margin reset to default (SUR +${CONFIG.survivalSafetyMargin}).`);
+								break;
+							}
+
+							const m = what.match(/^(\d+)$/);
+							const levels = m ? parseInt(m[1], 10) : NaN;
+
+							if (!m || levels < 0) {
+								s.say(`Usage: ${CMD} daily safety <levels>   e.g. ${CMD} daily safety 5   (or "default" to reset)`);
+								s.say(`Currently: SUR +${s.survivalMargin()}`);
+								break;
+							}
+
+							s.daily.survivalMargin = levels;
+							s.persistDaily();
+							s.say(`Safety margin set to SUR +${levels} -- deposit + recall trigger once the finishing node's ` +
+								`level exceeds that.`);
 							break;
 						}
 
@@ -3089,7 +3229,7 @@ module.exports = {
 						if (!arg) {
 							s.say(s.finishers.length
 								? `After the daily cycle: ${s.finishers.map(describeFinisher).join(", ")}`
-								: `Nothing set. Try ${CMD} after gauntlet 3 | dungeon 5`);
+								: `Nothing set. Try ${CMD} after deposit | gauntlet 3 | dungeon 5`);
 							break;
 						}
 
@@ -3102,7 +3242,7 @@ module.exports = {
 
 						const parts = arg.split("|").map((x) => parseFinisher(x));
 						if (parts.some((x) => !x)) {
-							s.say(`Usage: ${CMD} after waypoint <x> <y>|<town> | gauntlet [id] | dungeon [id]`);
+							s.say(`Usage: ${CMD} after waypoint <x> <y>|<town> | gauntlet [id] | dungeon [id] | deposit`);
 							s.say(`       ${CMD} after clear`);
 							break;
 						}

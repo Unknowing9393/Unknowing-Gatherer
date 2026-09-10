@@ -12,8 +12,8 @@ It registers the command `/unkgather`, aliased to the shorter `/unkg`. Everythin
 - Learns node positions and per-step travel time from real runs — no manual map data needed
 - `!recall` is only used when it actually saves a meaningful chunk of travel (configurable threshold)
 - Persistent per-day statistics, queryable with `/unkg stats`
-- Post-cycle actions: set a waypoint, queue a gauntlet, or start a dungeon once gathering finishes
-- Optional hardcore mode: auto-recover (home, recall, re-equip) on death
+- Post-cycle actions: set a waypoint, queue a gauntlet, start a dungeon, or deposit loot once gathering finishes
+- Hardcore recovery (home, recall, re-equip) on a `[HARDCORE]`-tagged death, on by default
 
 ## Installing
 
@@ -100,11 +100,20 @@ A daily cycle starts with `!recall` + `!home` to establish a known starting poin
 /unkg daily recall default  # reset to the 25% default
 ```
 
+If the last node worked today needs more SUR (from `!stats`) than you have plus a safety margin, the mobs guarding it are assumed too dangerous to linger near, so a `!deposit` + unconditional `!recall` run automatically before any post-cycle actions below:
+
+```
+/unkg daily safety <levels>  # deposit + recall if finishing node's Lv > SUR + levels (default 5)
+/unkg daily safety default   # reset to the default margin
+```
+
+`!equipbest` also always runs at the very end of the cycle (after any safety deposit/recall, before the actions below), so gear is optimal no matter where the day ends -- this is automatic and not user-configurable.
+
 Post-cycle actions (run once daily gathering finishes):
 
 ```
 /unkg after gauntlet 3
-/unkg after waypoint 180 240 | dungeon 5   # chain several
+/unkg after deposit | waypoint 180 240 | dungeon 5   # chain several
 /unkg after clear                          # cancel them
 ```
 
@@ -139,20 +148,17 @@ Map and home:
 
 ## Hardcore mode
 
-For permadeath runs:
+Every `[DEATH]` line halts anything currently running (won't auto-resume the queue) -- that part always happens. But a `[HARDCORE]`-tagged death (the game scatters your equipped items to a dungeon) also triggers automatic recovery by default:
+
+1. Sets your home town to SeedHaven
+2. Recalls there
+3. Re-equips your best gear once
+
+A normal (non-hardcore) death does nothing beyond the halt. On by default and persists across Lounge restarts -- turn it off with:
 
 ```
-/unkg hardcore on
+/unkg hardcore off
 ```
-
-On a `[DEATH]` line from the bot, this:
-
-1. Halts anything currently running (won't auto-resume the queue)
-2. Sets your home town to SeedHaven
-3. Recalls there
-4. Re-equips your best gear once
-
-Off by default, and the setting persists across Lounge restarts. `/unkg hardcore off` disables it again.
 
 ## Notes
 
