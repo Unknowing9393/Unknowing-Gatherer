@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.24.0
+ * thelounge-plugin-seedrpg-gathering  v0.25.0
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -17,6 +17,10 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.25.0 Node selection now breaks same-level ties by distance instead of
+ *          list order -- previously an equally-eligible node hours away
+ *          could be picked over one standing right next to you. Applies to
+ *          the live daily pick (pickNode) and the "daily no" optimizer.
  *   0.24.0 Hardcore recovery is now on by default and only fires for a death
  *          actually carrying the game's own [HARDCORE] tag (equipped items
  *          scattered to a dungeon) -- a normal death still halts the queue
@@ -112,7 +116,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.24.0";
+const VERSION = "0.25.0";
 
 const fs = require("fs");
 const path = require("path");
@@ -1706,7 +1710,14 @@ class Session {
 
 		for (const act of Object.keys(plan)) {
 			const c = await this.candidates(act);
-			if (c.length) pool[act] = c;
+			if (!c.length) continue;
+
+			// Break same-level ties by distance from `from` -- otherwise the
+			// starting pick (and any level this later downgrades to) can land
+			// on a node hours away over one standing right next to it.
+			pool[act] = from
+				? c.slice().sort((a, b) => b.level - a.level || manhattan(from, a.pos) - manhattan(from, b.pos))
+				: c;
 		}
 
 		if (!Object.keys(pool).length) return null;
@@ -2173,9 +2184,15 @@ class Session {
 		return nodes;
 	}
 
-	/** Highest-level node at or below our skill level. */
+	/**
+	 * Highest-level node at or below our skill level. Among several tied at
+	 * that top level, prefers whichever is closest to `from` (default: last
+	 * known position) -- otherwise ties break on list order alone, which can
+	 * send us hours away from a same-level node standing right next to us.
+	 */
 	async pickNode(activity, opts) {
 		const quiet = opts && opts.quiet;
+		const from = (opts && opts.from) || this.lastPos;
 		const level = await this.getLevel(activity);
 		const nodes = await this.getNodes(activity);
 
@@ -2198,7 +2215,21 @@ class Session {
 			return lowest;
 		}
 
-		const best = eligible[0];
+		const tied = eligible.filter((n) => n.level === eligible[0].level);
+		let best = tied[0];
+		if (tied.length > 1 && from) {
+			let bestDist = Infinity;
+			for (const n of tied) {
+				const pos = this.nodePos(activity, n.name);
+				if (!pos) continue;
+				const d = manhattan(from, pos);
+				if (d < bestDist) {
+					bestDist = d;
+					best = n;
+				}
+			}
+		}
+
 		const next = sorted.filter((n) => n.level > level).pop();
 		if (!quiet) {
 			this.say(
