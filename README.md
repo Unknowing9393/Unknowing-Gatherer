@@ -14,6 +14,7 @@ It registers the command `/unkgather`, aliased to the shorter `/unkg`. Everythin
 - Persistent per-day statistics, queryable with `/unkg stats`
 - Post-cycle actions: set a waypoint, queue a gauntlet, start a dungeon, or deposit loot once gathering finishes
 - Hardcore recovery (home, recall, re-equip) on a `[HARDCORE]`-tagged death, on by default
+- Per-activity gear loadouts: snapshot equipped gear from `!inv` and auto-`!equip` it before that activity's runs
 
 ## Installing
 
@@ -55,6 +56,14 @@ Shows what's currently running, progress toward its limit, and how many runs are
 /unkg q fish 1 for 1h30m     # fish node 1 for an hour and a half
 ```
 
+`grind` is a special case -- there's no real command for it, it's just standing within range of a waypoint with nothing else queued, which the game auto-fights. So it only takes coordinates and a time limit:
+
+```
+/unkg q grind at 500 500 for 30m
+```
+
+This sends `!waypoint 500 500`, waits for it to be confirmed and then for `[MOVE]` to report within 10 steps of that spot, and only then starts the clock. It ends with `!waypoint clear` rather than a stop command, since neither exists for grinding. Gear is always equipped first -- a saved `grind gear` loadout if you have one, otherwise `!equip best`, since grinding is pure combat.
+
 Queued runs go one after another. To loop a set forever, use `rotate`:
 
 ```
@@ -68,16 +77,14 @@ Queued runs go one after another. To loop a set forever, use `rotate`:
 
 ## The daily cycle
 
-Run every gathering skill once a day, unattended, routed by the shortest path between discovered nodes.
+Run gathering skills once a day, unattended, within a single wall-clock time budget -- travel between discovered nodes is estimated and subtracted first, and the rest is gathering time.
 
 ```
-/unkg daily all for 1h                           # one hour of every activity
-/unkg daily all for 1h, fish for 15m, hunt off    # per-activity overrides
-/unkg daily within 10h                            # fit everything into a 10h budget, travel included
-/unkg daily mine for 90m, chop for 90m at 02:00   # optional "at HH:MM" UTC start time
+/unkg daily 10h            # split 10h across every activity, travel included
+/unkg daily 10h at 02:00   # optional "at HH:MM" UTC start time
 ```
 
-The game day resets at 00:00 UTC, so times are UTC. `within` divides a wall-clock budget across activities after estimating travel; `all`/per-activity sets a fixed baseline instead.
+The game day resets at 00:00 UTC, so times (and the `at` suffix) are UTC.
 
 ```
 /unkg daily              # schedule + next run time
@@ -91,7 +98,20 @@ The game day resets at 00:00 UTC, so times are UTC. `within` divides a wall-cloc
 /unkg daily off           # cancel
 ```
 
-If a schedule leaves too little gathering time per stop, the plugin warns and refuses to run it until you `accept` it (or fix the plan), reminding every 30 minutes between 00:00 UTC and the scheduled start.
+If a schedule leaves too little gathering time per stop, the plugin warns and refuses to run it until you `accept` it (or shrink the plan), reminding every 30 minutes between 00:00 UTC and the scheduled start.
+
+### Specializing
+
+More stops means more travel, and travel time only grows the more of the map you've unlocked -- doing all six gathering skills every day eventually spends most of the budget just walking. If you mainly care about one skill, specialize in it: it gets the bulk of the budget, and one other activity rotates in daily for the rest, so every activity still gets covered eventually without doing all of them every day.
+
+```
+/unkg daily specialize hunt        # hunt gets 75% (the default) of the budget
+/unkg daily specialize hunt 80     # hunt gets 80% instead
+/unkg daily specialize off         # back to splitting the budget across every activity
+/unkg daily specialize             # show the current specialty, if any
+```
+
+Which activity fills the remaining share advances by one every time the cycle actually runs, cycling through the other five in order, so a week of hunt-specialized days looks like hunt+mine, hunt+chop, hunt+salvage, hunt+forage, hunt+fish, hunt+mine, ... Because the two stops for the day aren't known until the cycle actually fires, specialty mode skips the usual pre-run preview/accept step -- the split (and estimated travel) is reported when the cycle starts instead.
 
 A daily cycle starts with `!recall` + `!home` to establish a known starting point. Since `!recall` spends a consumable, it's only used when recalling home actually saves a meaningful chunk of travel:
 
@@ -107,7 +127,7 @@ If the last node worked today needs more SUR (from `!stats`) than you have plus 
 /unkg daily safety default   # reset to the default margin
 ```
 
-`!equipbest` also always runs at the very end of the cycle (after any safety deposit/recall, before the actions below), so gear is optimal no matter where the day ends -- this is automatic and not user-configurable.
+`!equip best` also always runs at the very end of the cycle (after any safety deposit/recall, before the actions below), so gear is optimal no matter where the day ends -- this is automatic and not user-configurable.
 
 Post-cycle actions (run once daily gathering finishes):
 
@@ -160,10 +180,21 @@ A normal (non-hardcore) death does nothing beyond the halt. On by default and pe
 /unkg hardcore off
 ```
 
+## Gear loadouts
+
+Stand next to (or already be running) an activity and snapshot your currently equipped gear as that activity's loadout:
+
+```
+/unkg hunt gear
+/unkg mine gear     # also: chop, salvage, forage, fish, grind
+```
+
+This reads `!inv`'s default view (one line per equip slot, the `[E]`-flagged item's `#id`) and saves all 16 slots' item ids. From then on, every time that activity's queue starts a run, the plugin sends `!equip <id1> <id2> ...` first, so gear swaps automatically per activity -- useful if, say, hunting wants a combat-heavy set and mining doesn't need one at all.
+
 ## Notes
 
 - Time formats accepted everywhere: `45s`, `10m`, `1h30m`, `04:30`. Node names with spaces are fine unquoted.
-- Persistent state (daily schedule, learned node map, per-day stats, hardcore setting) is stored per-network under The Lounge's plugin storage directory.
+- Persistent state (daily schedule, learned node map, per-day stats, hardcore setting, gear loadouts) is stored per-network under The Lounge's plugin storage directory.
 - Full command reference is always available in-client with `/unkg help`.
 
 ## License

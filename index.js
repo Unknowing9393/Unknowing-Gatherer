@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.25.0
+ * thelounge-plugin-seedrpg-gathering  v0.28.0
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -14,9 +14,40 @@
  *   /unkgather q forage 3 for 10m   run !forage 3 for ten minutes
  *   /unkgather q mine 2 x25         run !mine 2 until 25 successful actions
  *   /unkgather q chop 1 until 500xp run !chop 1 until 500xp gained
+ *   /unkgather q grind at 500 500 for 30m  waypoint there, time only
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.28.0 "daily" is simplified to a single wall-clock time budget --
+ *          "daily 10h [at 02:00]" is now the only way to configure it, with
+ *          every activity sharing that budget equally by default. The old
+ *          per-activity clauses ("all for 1h", "<act> for X", "<act> off",
+ *          "within Xh, fish off", xN/until-Nxp limits) are gone; travel got
+ *          too expensive as more of the map unlocked to keep running every
+ *          activity daily, which this doesn't fix by itself -- "specialize"
+ *          below does. New: "daily specialize <activity> [pct]" (default
+ *          75%) makes that activity the bulk of every day's budget, with
+ *          one other activity rotating in daily for the remainder, cycling
+ *          through all of them over time instead of running all six daily.
+ *          "daily specialize off" reverts to the equal split.
+ *   0.27.1 Grind now falls back to "!equip best" when no "grind gear" loadout
+ *          is saved, instead of equipping nothing -- unlike the gathering
+ *          activities, it's pure combat, so something should always be on.
+ *   0.27.0 "grind" is now queueable: "q grind at <x> <y> for <time>" sends
+ *          !waypoint <x> <y>, waits for it to be confirmed and then for
+ *          [MOVE] to report within grindArriveSteps (10) of the target, and
+ *          only then starts the (time-only) clock. Ends with "!waypoint
+ *          clear" instead of "!<activity> stop", since neither a start nor
+ *          a stop command actually exists for it -- also supports "grind
+ *          gear" like the gathering activities.
+ *   0.26.0 Per-activity gear loadouts: "<activity> gear" (hunt|mine|chop|
+ *          salvage|forage|fish) reads !inv's default view, saves every
+ *          [E]-flagged slot's item id, and "!equip"s that full loadout
+ *          before each future run of that activity.
+ *   0.25.1 Fixed the re-equip command: the game's actual syntax is
+ *          "!equip best" (two words), not "!equipbest" -- both the
+ *          end-of-cycle re-equip and hardcore recovery were sending the
+ *          invalid one-word form since it was first introduced.
  *   0.25.0 Node selection now breaks same-level ties by distance instead of
  *          list order -- previously an equally-eligible node hours away
  *          could be picked over one standing right next to you. Applies to
@@ -116,7 +147,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.25.0";
+const VERSION = "0.28.0";
 
 const fs = require("fs");
 const path = require("path");
@@ -175,6 +206,10 @@ const CONFIG = {
 	// How long to gather reply lines after asking DM a question.
 	collectMs: 4000,
 
+	// "!inv" spans one line per equip slot (16+) -- give it longer than the
+	// default collectMs so slower delivery doesn't truncate the listing.
+	invCollectMs: 8000,
+
 	// Re-use cached levels / node lists for this long before re-querying.
 	cacheMs: 5 * 60000,
 
@@ -183,6 +218,11 @@ const CONFIG = {
 
 	// How long to wait for "Started <x> at <node>!" before giving up on a run.
 	confirmMs: 25000,
+
+	// "grind" has no real start command -- it's just standing within this many
+	// steps of a waypoint with nothing else queued, which the game auto-fights.
+	// The timer starts once [MOVE] reports being this close.
+	grindArriveSteps: 10,
 
 	// The game day resets at 00:00 UTC, so the daily cycle defaults to just
 	// after the reset.
@@ -225,7 +265,7 @@ const CONFIG = {
 		recall: () => "!recall",
 		// Not user-facing either -- always appended at cycle end (see
 		// runFinishers) so gear is optimal regardless of where the day ends.
-		equipbest: () => "!equipbest",
+		equipbest: () => "!equip best",
 	},
 
 	// Gap between chained finisher commands.
@@ -321,6 +361,15 @@ function parseLine(line) {
 	// must not be billed against the run's time limit.
 	if (out.tag === "MOVE") {
 		out.move = true;
+		const c = out.body.match(/\((\d+)\s*,\s*(\d+)\)/);
+		if (c) out.coords = [parseInt(c[1], 10), parseInt(c[2], 10)];
+		return out;
+	}
+
+	// "!waypoint x y" acknowledgement -- this is the only "start" signal a
+	// grind run gets, since there is no real command for grinding itself.
+	if (out.tag === "TRAVEL") {
+		out.travel = true;
 		const c = out.body.match(/\((\d+)\s*,\s*(\d+)\)/);
 		if (c) out.coords = [parseInt(c[1], 10), parseInt(c[2], 10)];
 		return out;
@@ -506,6 +555,33 @@ function parseRecallStock(line, itemName) {
 }
 
 /**
+ * Reads one line of the default "!inv" reply, which lists one equip slot per
+ * line, e.g.:
+ *   Weapon: Skinning Sabre (5926/M) #4/4 [E] #5514282 | Felling Spear ...
+ *   Shield: Tracking Kite Shield (398/M) #3/3 [E] #1571296 | Assaying ...
+ *
+ * Each candidate item is "|"-separated; the equipped one is flagged [E]
+ * (always seen first in practice, but every chunk is checked in case that
+ * ever changes) and its trailing "#<id>" is what "!equip <id>" takes.
+ *
+ * Returns {slot, id} (id null if nothing in that slot is flagged [E]), or
+ * null if the line isn't a recognized gear slot at all.
+ */
+function parseEquippedSlot(line) {
+	const body = String(line).replace(RE.tag, "");
+	const m = body.match(/^([A-Za-z]+)\s*:\s*(.+)$/);
+	if (!m || !GEAR_SLOTS.includes(m[1])) return null;
+
+	for (const chunk of m[2].split(/\s*\|\s*/)) {
+		if (!/\[E\]/.test(chunk)) continue;
+		const id = chunk.match(/#(\d+)/);
+		return {slot: m[1], id: id ? id[1] : null};
+	}
+
+	return {slot: m[1], id: null};
+}
+
+/**
  * Reads the !stats reply, whose final field is the player's current position:
  *   Nick HP: 1300/1300 | Salvaging | striker | OFF:15 ... | online | (14, 481)
  *
@@ -671,6 +747,13 @@ class Run {
 	}
 }
 
+/** Fresh Run with the same activity/node/limit -- used to repeat a rotation. Preserves grind's targetPos. */
+function cloneRun(r) {
+	const run = new Run(r.activity, r.node, r.limit);
+	if (r.targetPos) run.targetPos = r.targetPos;
+	return run;
+}
+
 // ---------------------------------------------------------------------------
 // Session: one per network
 // ---------------------------------------------------------------------------
@@ -684,7 +767,16 @@ const DAILY_FILE = "unkgather-daily.json";
 const MAP_FILE = "unkgather-nodes.json";
 const STATS_FILE = "unkgather-stats.json";
 const HARDCORE_FILE = "unkgather-hardcore.json";
+const GEAR_FILE = "unkgather-gear.json";
 const STATS_KEEP_DAYS = 60;
+
+// Equip slots as !inv's default view lists them -- 10 shared combat slots
+// plus one gathering tool per activity (Axe/chop, Pick/mine, Rod/fish,
+// Cutter/salvage, Sickle/forage, Bow/hunt).
+const GEAR_SLOTS = [
+	"Weapon", "Shield", "Helm", "Armor", "Tunic", "Gloves", "Boots", "Amulet", "Ring", "Charm",
+	"Axe", "Pick", "Rod", "Cutter", "Sickle", "Bow",
+];
 
 /** UTC date key -- the game day resets at 00:00 UTC, so days are UTC days. */
 function utcDay(date) {
@@ -755,6 +847,14 @@ function writeHardcoreStore(obj) {
 	writeJson(HARDCORE_FILE, obj);
 }
 
+function readGearStore() {
+	return readJson(GEAR_FILE, {});
+}
+
+function writeGearStore(obj) {
+	writeJson(GEAR_FILE, obj);
+}
+
 class Session {
 	constructor(network, client, chanId) {
 		this.network = network;
@@ -772,7 +872,7 @@ class Session {
 		this.attached = false;
 		this.totals = {runs: 0, successes: 0, xp: 0, loot: new Map()};
 
-		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null, recallThreshold: null, survivalMargin: null, lastRunDay: null};
+		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null, recallThreshold: null, survivalMargin: null, specialty: null, specialtyCursor: 0, lastRunDay: null};
 		this.dailyTimer = null;
 		this.reminderTimer = null;
 		this.pendingWarnings = null;
@@ -781,6 +881,7 @@ class Session {
 		this.lastPos = null;   // most recent coordinates seen
 		this.lastNodeLevel = null;   // level of the last node a run was sent to
 		this.finishers = [];   // [{kind, arg}] run after the daily cycle
+		this.gear = {};        // activity -> [item id, ...] equipped before that activity's runs
 
 		this.levels = new Map();     // skill -> {level, at}
 		this.nodeCache = new Map();  // activity -> {nodes, at}
@@ -873,12 +974,42 @@ class Session {
 			return;
 		}
 
+		// The waypoint command's own acknowledgement -- the only "start" a
+		// grind run gets. A route through unmapped territory can print this
+		// twice (survey beacon consumed), so only the first, while still
+		// pending, actually begins the run.
+		if (p.travel) {
+			if (p.coords) this.lastPos = p.coords;
+			const r = this.current;
+			if (r && r.activity === "grind" && r.state === "pending") {
+				if (this.confirmTimer) {
+					clearTimeout(this.confirmTimer);
+					this.confirmTimer = null;
+				}
+				r.state = "traveling";
+				r.travelStartedAt = Date.now();
+				r.travelFrom = this.lastPos;
+				r.confirmedNode = r.node;
+				this.say(`Waypoint confirmed -- travelling to grind spot.`);
+			}
+			return;
+		}
+
 		if (p.move) {
 			const r = this.current;
 			if (r && r.state === "traveling") {
 				r.travelSteps++;
 				r.lastProgress = Date.now();
 				if (p.coords) r.coords = p.coords;
+
+				if (r.activity === "grind" && r.targetPos && r.coords &&
+					manhattan(r.coords, r.targetPos) <= CONFIG.grindArriveSteps) {
+					r.travelMs = Date.now() - r.travelStartedAt;
+					r.state = "running";
+					r.startedAt = Date.now();
+					this.say(`Within ${CONFIG.grindArriveSteps} steps of the grind spot -- starting ${fmt(r.limit.value)} timer.`);
+					this.armTimer();
+				}
 			}
 			if (p.coords) this.lastPos = p.coords;
 			return;
@@ -1342,6 +1473,8 @@ class Session {
 			adapt: Boolean(saved.adapt),
 			recallThreshold: typeof saved.recallThreshold === "number" ? saved.recallThreshold : null,
 			survivalMargin: typeof saved.survivalMargin === "number" ? saved.survivalMargin : null,
+			specialty: saved.specialty || null,
+			specialtyCursor: saved.specialtyCursor || 0,
 			lastRunDay: saved.lastRunDay || null,
 			plan: saved.plan || (saved.limit
 				? Object.fromEntries(Object.keys(ACTIVITIES).map((a) => [a, saved.limit]))
@@ -1382,6 +1515,8 @@ class Session {
 				adapt: Boolean(this.daily.adapt),
 				recallThreshold: typeof this.daily.recallThreshold === "number" ? this.daily.recallThreshold : null,
 				survivalMargin: typeof this.daily.survivalMargin === "number" ? this.daily.survivalMargin : null,
+				specialty: this.daily.specialty || null,
+				specialtyCursor: this.daily.specialtyCursor || 0,
 				lastRunDay: this.daily.lastRunDay || null,
 				finishers: this.finishers,
 			};
@@ -1408,6 +1543,22 @@ class Session {
 		writeHardcoreStore(store);
 	}
 
+	restoreGear() {
+		this.gear = readGearStore()[this.dailyKey()] || {};
+	}
+
+	persistGear() {
+		const store = readGearStore();
+		store[this.dailyKey()] = this.gear;
+		writeGearStore(store);
+	}
+
+	/** Saved item ids to !equip before an activity's runs, or null if none saved. */
+	gearFor(activity) {
+		const ids = this.gear[activity];
+		return ids && ids.length ? ids : null;
+	}
+
 	/**
 	 * Hardcore-mode recovery, run once per [DEATH]: reset home to a fixed town
 	 * (SeedHaven, away from whatever spot got us killed), recall there, then
@@ -1415,10 +1566,10 @@ class Session {
 	 * "resume" so a death is never glossed over.
 	 */
 	hardcoreRecover() {
-		this.say(`Hardcore recovery: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest.`);
+		this.say(`Hardcore recovery: !home ${CONFIG.hardcoreHomeTown}, !recall, !equip best.`);
 		this.send(`!home ${CONFIG.hardcoreHomeTown}`);
 		setTimeout(() => this.send("!recall"), CONFIG.minGapMs);
-		setTimeout(() => this.send("!equipbest"), CONFIG.minGapMs + CONFIG.recallMs);
+		setTimeout(() => this.send("!equip best"), CONFIG.minGapMs + CONFIG.recallMs);
 	}
 
 	/**
@@ -1446,6 +1597,57 @@ class Session {
 		return typeof this.daily.survivalMargin === "number"
 			? this.daily.survivalMargin
 			: CONFIG.survivalSafetyMargin;
+	}
+
+	/**
+	 * When specialty mode is on, replaces today's plan with just two stops:
+	 * the specialty activity gets `pct` of the day's gathering time (budget
+	 * minus travel estimated for these two specifically), the rest goes to
+	 * whichever other activity is next in rotation -- so every activity
+	 * still gets covered eventually without doing all of them daily.
+	 * Returns false (and leaves the plan untouched) if there's no budget to
+	 * split, since a specialty split has nothing to work from otherwise.
+	 */
+	async buildSpecialtyPlan() {
+		const {activity, pct} = this.daily.specialty;
+
+		if (!this.daily.budget) {
+			this.say(`Specialty mode needs a time budget -- set one with ${CMD} daily 10h.`);
+			return false;
+		}
+
+		const others = Object.keys(ACTIVITIES).filter((a) => a !== activity);
+		const idx = (this.daily.specialtyCursor || 0) % others.length;
+		const secondary = others[idx];
+		this.daily.specialtyCursor = idx + 1;
+		this.persistDaily();
+
+		// Equal placeholder shares just to learn the route/travel cost for
+		// these two stops -- overwritten below with the real weighted split.
+		this.daily.plan = {[activity]: {kind: "share"}, [secondary]: {kind: "share"}};
+
+		let est = null;
+		try {
+			est = await this.estimateDaily(this.lastPos || this.home());
+		} catch (err) {
+			est = null;
+		}
+
+		const travel = est ? est.estTravel : 0;
+		const spare = Math.max(this.daily.budget - travel, CONFIG.minShareMs * 2);
+		const specialtyMs = Math.max(Math.floor(spare * pct), CONFIG.minShareMs);
+		const secondaryMs = Math.max(Math.floor(spare * (1 - pct)), CONFIG.minShareMs);
+
+		this.daily.plan = {
+			[activity]: {kind: "time", value: specialtyMs},
+			[secondary]: {kind: "time", value: secondaryMs},
+		};
+
+		this.say(
+			`Specialty today: ${activity} ${fmt(specialtyMs)} (${Math.round(pct * 100)}%) + ` +
+			`${secondary} ${fmt(secondaryMs)} (${Math.round((1 - pct) * 100)}%) -- ~${fmt(travel)} travel.`
+		);
+		return true;
 	}
 
 	clearReminders() {
@@ -1517,7 +1719,7 @@ class Session {
 		}, delay);
 	}
 
-	/** Queue every gathering activity once, each with the shared limit. */
+	/** Queue every gathering activity once, each with the shared limit (or, in specialty mode, just today's two). */
 	fireDaily() {
 		if (!this.daily.enabled) return;
 
@@ -1540,10 +1742,21 @@ class Session {
 		this.dailyStartedAt = Date.now();
 		this.armDaily();        // schedule the next slot before the work begins
 
-		// Recall home first so the route plans from a known origin -- but only
-		// if a teleport is actually held. Without one, !recall does nothing and
-		// planning from "home" would be planning from somewhere we are not.
-		this.startDailyFromKnownPosition();
+		(async () => {
+			if (this.daily.specialty) {
+				const ok = await this.buildSpecialtyPlan();
+				if (!ok) {
+					this.dailyRunActive = false;
+					return;
+				}
+			}
+
+			// Recall home first so the route plans from a known origin -- but
+			// only if a teleport is actually held. Without one, !recall does
+			// nothing and planning from "home" would be planning from
+			// somewhere we are not.
+			this.startDailyFromKnownPosition();
+		})();
 	}
 
 	/**
@@ -2109,12 +2322,15 @@ class Session {
 
 	dailyStatus() {
 		if (!this.daily.enabled) {
-			return `Daily cycle off. Set with ${CMD} daily all for 1h [at 02:00]`;
+			return `Daily cycle off. Set with ${CMD} daily 10h [at 02:00]`;
 		}
 		const when = this.nextDailyAt();
 		const inMs = when.getTime() - Date.now();
 		const plan = this.daily.plan || {};
-		const what = this.daily.budget
+		const what = this.daily.specialty
+			? `specializing in ${this.daily.specialty.activity} (${Math.round(this.daily.specialty.pct * 100)}%) ` +
+			  `within ${fmt(this.daily.budget)} (travel included)`
+			: this.daily.budget
 			? `${Object.keys(plan).length} activities within ${fmt(this.daily.budget)} (travel included)`
 			: describePlan(plan);
 		return `Daily cycle on -- ${what}, at ${fmtUtc(this.daily.atMin)} ` +
@@ -2330,7 +2546,7 @@ class Session {
 		this.adaptRemaining();
 
 		if (!this.queue.length && this.rotation) {
-			this.queue = this.rotation.map((r) => new Run(r.activity, r.node, r.limit));
+			this.queue = this.rotation.map(cloneRun);
 		}
 
 		if (!this.queue.length) {
@@ -2348,6 +2564,45 @@ class Session {
 		this.starting = true;
 
 		try {
+			// Grind has no node, no start command, and no confirmation line of
+			// its own -- see parseLine's TRAVEL handling and the p.travel/p.move
+			// branches in onLine for how "arrival" and the timer actually work.
+			if (run.activity === "grind") {
+				if (this.halted) return;
+
+				this.current = run;
+				run.reset();
+				run.state = "pending";
+
+				const [gx, gy] = run.targetPos;
+				const sendStart = () => {
+					this.send(`!waypoint ${gx} ${gy}`);
+					this.say(`Sent !waypoint ${gx} ${gy} -- awaiting travel confirmation`);
+
+					this.confirmTimer = setTimeout(() => {
+						this.confirmTimer = null;
+						if (this.current === run && run.state === "pending") {
+							this.say(`No waypoint confirmation after ${fmt(CONFIG.confirmMs)} -- skipping.`);
+							this.current = null;
+							this.advance();
+						}
+					}, CONFIG.confirmMs);
+				};
+
+				// Grind is pure combat, so unlike the gathering activities it
+				// still equips something even with no saved loadout.
+				const gear = this.gearFor(run.activity);
+				if (gear) {
+					this.send(`!equip ${gear.join(" ")}`);
+					this.say(`Equipping grind loadout (${gear.length} items).`);
+				} else {
+					this.send("!equip best");
+					this.say("No grind loadout saved -- equipping best gear.");
+				}
+				setTimeout(sendStart, CONFIG.minGapMs);
+				return;
+			}
+
 			let node = run.node;
 
 			if (node === AUTO || (!node && CONFIG.autoNode)) {
@@ -2375,23 +2630,44 @@ class Session {
 			run.reset();
 			run.state = "pending";
 			run.requestedNode = node;
-			this.send(node ? `!${run.activity} ${node}` : `!${run.activity}`);
-			this.say(`Sent !${run.activity}${node ? " " + node : ""}` +
-				(run.resolved ? ` (${run.resolved.name}, Lv${run.resolved.level}+)` : "") +
-				` -- awaiting confirmation`);
 
-			// The clock starts only when DM confirms. Until then, nothing counts.
-			this.confirmTimer = setTimeout(() => {
-				this.confirmTimer = null;
-				if (this.current === run && run.state === "pending") {
-					this.say(`No start confirmation for !${run.activity} after ${fmt(CONFIG.confirmMs)} -- skipping.`);
-					this.current = null;
-					this.advance();
-				}
-			}, CONFIG.confirmMs);
+			const startCmd = node ? `!${run.activity} ${node}` : `!${run.activity}`;
+			const sendStart = () => {
+				this.send(startCmd);
+				this.say(`Sent ${startCmd}` +
+					(run.resolved ? ` (${run.resolved.name}, Lv${run.resolved.level}+)` : "") +
+					` -- awaiting confirmation`);
+
+				// The clock starts only when DM confirms. Until then, nothing counts.
+				this.confirmTimer = setTimeout(() => {
+					this.confirmTimer = null;
+					if (this.current === run && run.state === "pending") {
+						this.say(`No start confirmation for !${run.activity} after ${fmt(CONFIG.confirmMs)} -- skipping.`);
+						this.current = null;
+						this.advance();
+					}
+				}, CONFIG.confirmMs);
+			};
+
+			// A saved loadout (see "<activity> gear") is equipped first, since
+			// combat gear can matter as much as the tool for what mobs a node
+			// throws at us.
+			const gear = this.gearFor(run.activity);
+			if (gear) {
+				this.send(`!equip ${gear.join(" ")}`);
+				this.say(`Equipping ${run.activity} loadout (${gear.length} items).`);
+				setTimeout(sendStart, CONFIG.minGapMs);
+			} else {
+				sendStart();
+			}
 		} finally {
 			this.starting = false;
 		}
+	}
+
+	/** Grind has no real stop command either -- clearing the waypoint ends the farm-anchor. */
+	stopCommandFor(run) {
+		return run.activity === "grind" ? "!waypoint clear" : `!${run.activity} stop`;
 	}
 
 	finishRun() {
@@ -2399,7 +2675,7 @@ class Session {
 		if (!run) return;
 
 		this.clearTimer();
-		this.send(`!${run.activity} stop`);
+		this.send(this.stopCommandFor(run));
 		this.say(run.summary());
 		this.recordRun(run);
 
@@ -2422,7 +2698,7 @@ class Session {
 		const run = this.current;
 		this.clearTimer();
 		if (run) {
-			this.send(`!${run.activity} stop`);
+			this.send(this.stopCommandFor(run));
 			this.say(`${run.summary()} (${reason})`);
 			// Work done before an early stop still counts.
 			if (run.state === "running" && run.ticks) this.recordRun(run);
@@ -2483,91 +2759,12 @@ function extractLimit(text) {
  *   gauntlet Rust solo |   dungeon 5            |   dungeon
  */
 /**
- * Parses a daily plan: a comma-separated list of "<activity|all> <limit>"
- * clauses. "all" sets the baseline for every activity; a named activity
- * overrides it. "<activity> off" excludes one.
- *
- *   all for 1h
- *   all for 1h, fish for 15m
- *   all for 1h, fish off
- *   mine for 90m, chop for 90m          (only these two run)
- *
- * Returns {plan: {activity: limit}, errors: []}. Every limit is independent,
- * so activities are equalised by time rather than by level.
+ * Describes a plan for display. Only still reachable for a plan persisted
+ * before the daily command was simplified to a single time budget (see
+ * CHANGELOG) -- any plan set since then always has a budget, so dailyStatus
+ * never calls this in practice, but it lets old persisted state still show
+ * something sensible instead of crashing.
  */
-function parseDailyPlan(text) {
-	const plan = {};
-	const errors = [];
-	let baseline = null;
-	let budget = null;
-
-	for (const raw of String(text).split(",")) {
-		const clause = raw.trim();
-		if (!clause) continue;
-
-		// "within 10h" / "total 10h" -- a wall-clock budget covering travel.
-		// Gathering time is derived from it once the route is known.
-		const b = clause.match(/^(?:all\s+)?(?:within|total|budget|in)\s+(.+)$/i);
-		if (b) {
-			const ms = parseDuration(b[1]);
-			if (!ms) {
-				errors.push(`bad duration "${b[1]}"`);
-				continue;
-			}
-			budget = ms;
-			baseline = {kind: "share"};   // placeholder, resolved at plan time
-			continue;
-		}
-
-		// "<name> off" excludes an activity from the cycle.
-		const off = clause.match(/^(\S+)\s+(?:off|skip|none)$/i);
-		if (off) {
-			const act = resolveActivity(off[1]);
-			if (!act) {
-				errors.push(`unknown activity "${off[1]}"`);
-				continue;
-			}
-			plan[act] = null;
-			continue;
-		}
-
-		const {limit, rest} = extractLimit(clause);
-		if (!limit) {
-			errors.push(`no limit in "${clause}"`);
-			continue;
-		}
-
-		const who = rest.trim().toLowerCase();
-
-		if (!who || who === "all" || who === "each" || who === "every") {
-			baseline = limit;
-			continue;
-		}
-
-		const act = resolveActivity(who);
-		if (!act) {
-			errors.push(`unknown activity "${who}"`);
-			continue;
-		}
-
-		plan[act] = limit;
-	}
-
-	// Apply the baseline to anything not named explicitly.
-	if (baseline) {
-		for (const act of Object.keys(ACTIVITIES)) {
-			if (!(act in plan)) plan[act] = baseline;
-		}
-	}
-
-	// Drop excluded entries now that the baseline has been applied.
-	for (const act of Object.keys(plan)) {
-		if (!plan[act]) delete plan[act];
-	}
-
-	return {plan, errors, baseline, budget};
-}
-
 function describePlan(plan) {
 	const acts = Object.keys(plan);
 	if (!acts.length) return "nothing";
@@ -2625,6 +2822,22 @@ function parseRun(text) {
 
 	const parts = s.trim().replace(/^!/, "").split(/\s+/);
 	const activity = (parts.shift() || "").toLowerCase();
+
+	if (activity === "grind") {
+		// "grind at <x> <y>" -- time only. There is no real command for
+		// grinding: it's just standing within range of a waypoint with
+		// nothing else queued, which the game auto-fights.
+		if (!limit || limit.kind !== "time") return null;
+		if ((parts[0] || "").toLowerCase() === "at") parts.shift();
+
+		const x = parseInt(parts[0], 10), y = parseInt(parts[1], 10);
+		if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+
+		const run = new Run("grind", `${x},${y}`, limit);
+		run.targetPos = [x, y];
+		return run;
+	}
+
 	if (!ACTIVITIES[activity]) return null;
 
 	const node = parts.join(" ") || (CONFIG.autoNode ? AUTO : null);
@@ -2661,12 +2874,13 @@ function helpLines() {
 		`  ${CMD} list                   :show what is running and queued`,
 		`  ${CMD} clear                  :empty queue and stop any rotation`,
 		"",
-		"DAILY  -- run every gathering skill once a day, unattended",
-		`  ${CMD} daily within 10h      :fit everything in 10h, travel included`,
-		`  ${CMD} daily within 10h, fish off :fit everthing in 10h, travel included, fishing is skipped`,
-		`  ${CMD} daily all for 1h      :one hour of every activity`,
-		`  ${CMD} daily all for 1h, fish for 15m, hunt off :one hour of every activity, but fishing is limited to 15m and hunting is skipped`,
-		`  ${CMD} daily mine for 90m, chop for 90m at 02:00 :only mining and chopping is performed and for 90min each at 02:00`,
+		"DAILY  -- run gathering skills once a day, unattended, within a time budget",
+		`  ${CMD} daily 10h             :split 10h across every activity, travel included`,
+		`  ${CMD} daily 10h at 02:00    :same, scheduled for 02:00 UTC instead of the default`,
+		`  ${CMD} daily specialize hunt 75 :hunt gets 75% of the budget; one other activity`,
+		"                                rotates in daily for the remaining 25%, so every",
+		"                                activity is still covered without doing all of them.",
+		`  ${CMD} daily specialize off  :back to splitting the budget across every activity`,
 		`  ${CMD} daily                 :show schedule and next run`,
 		`  ${CMD} daily now             :run the cycle immediately, any time`,
 		`  ${CMD} daily accept          :allow a schedule that was warned about`,
@@ -2679,8 +2893,7 @@ function helpLines() {
 		`  ${CMD} daily safety <levels> :deposit + recall if the finishing node's Lv exceeds SUR + levels (default 5)`,
 		"       Unaccepted schedules are reminded every 30m from 00:00 UTC.",
 		`  ${CMD} daily off             :cancel`,
-		"       Each activity gets its own time; 'all' sets a baseline.",
-		"       'within' divides a wall-clock budget after estimating travel.",
+		"       The budget is a wall-clock ceiling; travel is estimated and subtracted first.",
 		"       The game day resets at 00:00 UTC; times are UTC.",
 		"       !recall costs a consumable, so it is only used when the route",
 		"       from home beats the route from where you are by enough (see recall above).",
@@ -2701,7 +2914,9 @@ function helpLines() {
 		`  ${CMD} skip                   :abandon current run, start next`,
 		`  ${CMD} stop                   :stop everything, clear queue`,
 		`  ${CMD} resume                 :un-halt after a blocked state`,
-		`  ${CMD} hardcore on|off        :on a [HARDCORE] death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest (on by default)`,
+		`  ${CMD} hardcore on|off        :on a [HARDCORE] death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equip best (on by default)`,
+		`  ${CMD} hunt gear               :snapshot currently equipped gear (!inv) as the hunt loadout`,
+		"       Also: mine|chop|salvage|forage|fish|grind gear. Saved loadout is !equip'd before each run of that activity.",
 		`  ${CMD} loot                   :session totals (since last restart)`,
 		`  ${CMD} stats                  :today's totals per activity`,
 		`  ${CMD} stats yesterday        :also: week, all, days, YYYY-MM-DD`,
@@ -2746,6 +2961,7 @@ module.exports = {
 							? `${label}, watching PMs.`
 							: `${label}, but could not attach the PM listener.`);
 					}
+					s.restoreGear();
 				}
 				s.client = client;
 				s.chanId = target.chan;
@@ -2757,8 +2973,8 @@ module.exports = {
 				// Anything that needs to READ DM's replies is useless without
 				// the listener. Silently queueing work that can never observe a
 				// result is worse than failing loudly, so attach on demand.
-				const NEEDS_LISTENER = ["q", "queue", "rotate", "nodes", "levels", "skip", "resume", "daily", "after", "hardcore"];
-				if (NEEDS_LISTENER.includes(sub) && !s.attached) {
+				const NEEDS_LISTENER = ["q", "queue", "rotate", "nodes", "levels", "skip", "resume", "daily", "after", "hardcore", "grind"];
+				if ((NEEDS_LISTENER.includes(sub) || ACTIVITIES[sub]) && !s.attached) {
 					if (!s.attach()) return;   // attach() already reported why
 					s.say(`Auto-attached (run ${CMD} on to do this explicitly).`);
 				}
@@ -2780,6 +2996,7 @@ module.exports = {
 						const run = parseRun(rest);
 						if (!run) {
 							s.say(`Usage: ${CMD} q <${acts}> [node] [for 10m | x25 | until 500xp]`);
+							s.say(`       ${CMD} q grind at <x> <y> for 30m   (time only -- no real grind command exists)`);
 							break;
 						}
 						s.queue.push(run);
@@ -2800,7 +3017,7 @@ module.exports = {
 							break;
 						}
 						s.rotation = runs;
-						s.queue = runs.map((r) => new Run(r.activity, r.node, r.limit));
+						s.queue = runs.map(cloneRun);
 						s.say(`Rotation set: ${runs.map((r) => r.describe()).join(" -> ")}`);
 						if (!s.current) s.advance();
 						break;
@@ -2843,8 +3060,55 @@ module.exports = {
 						}
 						s.say(`Hardcore death recovery ${s.hardcore ? "on" : "off"} (default: on)` +
 							(s.hardcore
-								? ` -- on a [HARDCORE]-tagged death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equipbest.`
+								? ` -- on a [HARDCORE]-tagged death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equip best.`
 								: " -- a hardcore death will still halt the queue, but nothing recovers automatically."));
+						break;
+					}
+
+					case "hunt":
+					case "mine":
+					case "chop":
+					case "salvage":
+					case "forage":
+					case "fish":
+					case "grind": {
+						const activity = sub;
+						const action = (rest || "").trim().toLowerCase();
+
+						if (action !== "gear") {
+							s.say(`Usage: ${CMD} ${activity} gear   :snapshot currently equipped gear as the ${activity} loadout`);
+							break;
+						}
+
+						(async () => {
+							s.say("Reading !inv...");
+							let lines = [];
+							try {
+								lines = await s.ask("!inv", null, CONFIG.invCollectMs);
+							} catch (err) {
+								lines = [];
+							}
+
+							const found = {};
+							for (const line of lines) {
+								const slot = parseEquippedSlot(line);
+								if (slot && slot.id) found[slot.slot] = slot.id;
+							}
+
+							const ids = GEAR_SLOTS.map((slot) => found[slot]).filter(Boolean);
+							if (!ids.length) {
+								s.say("Could not parse any equipped items from !inv -- try again, or run !inv manually to check the format.");
+								return;
+							}
+
+							s.gear[activity] = ids;
+							s.persistGear();
+
+							const missing = GEAR_SLOTS.filter((slot) => !found[slot]);
+							s.say(`Saved ${activity} loadout: ${ids.length}/${GEAR_SLOTS.length} slots` +
+								(missing.length ? ` | empty: ${missing.join(", ")}` : "") +
+								` -- equipped automatically before each ${activity} run.`);
+						})();
 						break;
 					}
 
@@ -3004,9 +3268,66 @@ module.exports = {
 							break;
 						}
 
+						if (/^specializ/i.test(arg)) {
+							const what = arg.replace(/^specializ[a-z]*\s*/i, "").trim();
+
+							if (!what) {
+								s.say(s.daily.specialty
+									? `Specializing in ${s.daily.specialty.activity} ` +
+									  `(${Math.round(s.daily.specialty.pct * 100)}%) -- one other activity ` +
+									  `rotates in for the rest each day.`
+									: "No specialty set -- the budget splits evenly across every activity.");
+								break;
+							}
+
+							if (/^(off|none|clear)$/i.test(what)) {
+								s.daily.specialty = null;
+								// The 6-way plan this reverts to was never previewed
+								// while specialty was active -- re-check it before
+								// trusting it to run unattended.
+								s.daily.accepted = false;
+								s.persistDaily();
+								s.say("Specialty cleared -- back to splitting the budget across every activity.");
+								break;
+							}
+
+							const m = what.match(/^(\S+)(?:\s+(\d+))?$/);
+							const act = m ? resolveActivity(m[1]) : null;
+
+							if (!act) {
+								s.say(`Usage: ${CMD} daily specialize <activity> [pct]   e.g. ${CMD} daily specialize hunt 75`);
+								s.say(`       ${CMD} daily specialize off`);
+								break;
+							}
+
+							const pct = m[2] ? parseInt(m[2], 10)
+								: s.daily.specialty ? Math.round(s.daily.specialty.pct * 100)
+								: 75;
+
+							if (pct < 1 || pct > 99) {
+								s.say("Percent must be between 1 and 99.");
+								break;
+							}
+
+							s.daily.specialty = {activity: act, pct: pct / 100};
+							// Specialty picks its own stops fresh each day -- there
+							// is no fixed plan left to preview/accept up front.
+							s.daily.accepted = true;
+							s.pendingWarnings = null;
+							s.pendingSummary = null;
+							s.clearReminders();
+							s.persistDaily();
+							s.say(
+								`Specializing in ${act} (${pct}%) -- one other activity rotates in for the ` +
+								`remaining ${100 - pct}% each day.` +
+								(s.daily.budget ? "" : ` Needs a time budget (${CMD} daily 10h).`)
+							);
+							break;
+						}
+
 						if (/^(adapt|adaptive)$/i.test(arg)) {
 							if (!s.daily.budget) {
-								s.say(`Adapt needs a budget -- set one with ${CMD} daily within 10h`);
+								s.say(`Adapt needs a budget -- set one with ${CMD} daily 10h`);
 								break;
 							}
 							s.daily.adapt = !s.daily.adapt;
@@ -3148,7 +3469,7 @@ module.exports = {
 
 						if (/^(now|run|start)$/i.test(arg)) {
 							if (!s.daily.enabled) {
-								s.say(`No daily cycle set. Configure one first, e.g. ${CMD} daily all for 1h`);
+								s.say(`No daily cycle set. Configure one first, e.g. ${CMD} daily 10h`);
 								break;
 							}
 							if (s.current || s.queue.length) {
@@ -3174,7 +3495,9 @@ module.exports = {
 							break;
 						}
 
-						// Optional "at HH:MM" suffix, then the per-activity plan.
+						// Optional "at HH:MM" suffix, then a total time budget --
+						// this is the only way to configure the daily cycle now;
+						// see "specialize" above for narrowing it to two activities.
 						let text = arg;
 						let atMin = s.daily.atMin;
 						const at = text.match(/\s*\bat\s+(\S+)\s*(?:utc)?$/i);
@@ -3188,32 +3511,37 @@ module.exports = {
 							text = text.slice(0, at.index);
 						}
 
-						const {plan, errors, budget} = parseDailyPlan(text);
+						const budget = parseDuration(text.replace(/^(?:within|total|budget|in|for)\s+/i, "").trim());
 
-						if (errors.length) {
-							s.say(`Could not parse: ${errors.join("; ")}`);
-							s.say(`Usage: ${CMD} daily all for 1h`);
-							s.say(`       ${CMD} daily within 10h            split a budget, travel included`);
-							s.say(`       ${CMD} daily within 10h, fish off`);
-							s.say(`       ${CMD} daily all for 1h, fish for 15m, hunt off`);
+						if (!budget) {
+							s.say(`Usage: ${CMD} daily 10h [at 02:00]`);
+							s.say(`       ${CMD} daily specialize hunt 75   run hunt most days, one other rotates in`);
+							s.say(`       ${CMD} daily off`);
 							break;
 						}
 
-						if (!Object.keys(plan).length) {
-							s.say(`Nothing scheduled. Try ${CMD} daily all for 1h`);
-							break;
-						}
+						const plan = Object.fromEntries(Object.keys(ACTIVITIES).map((a) => [a, {kind: "share"}]));
 
-						s.daily = {enabled: true, atMin, plan, budget, accepted: false,
+						s.daily = {
+							// Specialty mode picks its own two stops fresh each
+							// day, so there is nothing to preview/accept here.
+							enabled: true, atMin, plan, budget, accepted: Boolean(s.daily.specialty),
 							nodeOverrides: null, ignore: null, adapt: false,
-							recallThreshold: s.daily.recallThreshold};
+							recallThreshold: s.daily.recallThreshold,
+							survivalMargin: s.daily.survivalMargin,
+							specialty: s.daily.specialty,
+							specialtyCursor: s.daily.specialtyCursor || 0,
+							lastRunDay: s.daily.lastRunDay,
+						};
 						s.persistDaily();
 						s.armDaily();
 						s.say(s.dailyStatus());
 
 						// Preview the route so a bad schedule is caught now,
-						// not at 3am.
-						(async () => {
+						// not at 3am. Specialty mode picks its own two stops
+						// fresh each day, so a plain 6-way preview here would
+						// be misleading -- skip it.
+						if (!s.daily.specialty) (async () => {
 							let est = null;
 							try {
 								est = await s.estimateDaily(s.lastPos || s.home());
@@ -3242,15 +3570,6 @@ module.exports = {
 								`for a shorter route, or see ${CMD} daily options`);
 							s.armReminders();
 						})();
-
-						// Show the per-activity breakdown when it is not uniform.
-						const limits = new Set(Object.values(plan).map(describeLimit));
-						if (limits.size > 1 || Object.keys(plan).length < Object.keys(ACTIVITIES).length) {
-							Object.keys(plan).forEach((a) =>
-								s.say(`  ${a.padEnd(8)} ${describeLimit(plan[a])}`));
-							const skipped = Object.keys(ACTIVITIES).filter((a) => !(a in plan));
-							if (skipped.length) s.say(`  skipped: ${skipped.join(", ")}`);
-						}
 						break;
 					}
 
