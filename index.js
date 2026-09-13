@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.29.0
+ * thelounge-plugin-seedrpg-gathering  v0.29.1
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -18,6 +18,10 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.29.1 Fixed "<activity> gear" never matching any equipped item: the
+ *          real !inv output indents each slot line with leading spaces
+ *          ("  Weapon: ..."), which the parser's anchored regex didn't
+ *          allow for, so every line failed to match.
  *   0.29.0 Specialty mode picks its daily second activity more carefully: it
  *          first checks !daily (the game's own daily-task list) for an open
  *          task on one of the other activities that awards FL tokens, since
@@ -168,7 +172,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.29.0";
+const VERSION = "0.29.1";
 
 const fs = require("fs");
 const path = require("path");
@@ -619,7 +623,7 @@ function parseRecallStock(line, itemName) {
  */
 function parseEquippedSlot(line) {
 	const body = String(line).replace(RE.tag, "");
-	const m = body.match(/^([A-Za-z]+)\s*:\s*(.+)$/);
+	const m = body.match(/^\s*([A-Za-z]+)\s*:\s*(.+)$/);
 	if (!m || !GEAR_SLOTS.includes(m[1])) return null;
 
 	for (const chunk of m[2].split(/\s*\|\s*/)) {
