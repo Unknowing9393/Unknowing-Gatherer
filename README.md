@@ -111,7 +111,13 @@ More stops means more travel, and travel time only grows the more of the map you
 /unkg daily specialize             # show the current specialty, if any
 ```
 
-Which activity fills the remaining share advances by one every time the cycle actually runs, cycling through the other five in order, so a week of hunt-specialized days looks like hunt+mine, hunt+chop, hunt+salvage, hunt+forage, hunt+fish, hunt+mine, ... Because the two stops for the day aren't known until the cycle actually fires, specialty mode skips the usual pre-run preview/accept step -- the split (and estimated travel) is reported when the cycle starts instead.
+Which activity fills the remaining share normally just advances by one every time the cycle runs, cycling through the other five in order (hunt+mine, hunt+chop, hunt+salvage, ...). But first, it checks `!daily` (the game's own daily-task list) for an open task on one of those other activities that awards FL tokens -- gathering itself never grants FL, so a matching task jumps that activity in for today regardless of whose turn it is (highest FL wins; a tie between activities is broken by whichever's node has the shorter estimated travel *time* from the day's starting position -- not raw tile distance, since learned travel speed varies node to node).
+
+All of this -- the !daily check and every travel estimate -- runs only after the day's actual starting position is settled (home if recalling, otherwise wherever you last were), not before, so it never reasons from stale state.
+
+Either candidate (the FL jump, or the plain rotation pick) is only actually used if it leaves at least an hour of gathering time once its real travel is estimated. If not, every other activity is tried in turn and whichever leaves the most time wins instead, with a warning if even the best one still falls short -- a same-day pick can turn out to be much farther away than the one it's replacing, and a few minutes of gathering after hours of travel isn't worth doing. Either way, the rotation cursor advances past whichever activity actually gets used, so it doesn't cost that activity its normal turn later.
+
+Because the two stops for the day aren't known until the cycle actually fires, specialty mode skips the usual pre-run preview/accept step -- the split (and estimated travel) is reported when the cycle starts instead.
 
 A daily cycle starts with `!recall` + `!home` to establish a known starting point. Since `!recall` spends a consumable, it's only used when recalling home actually saves a meaningful chunk of travel:
 

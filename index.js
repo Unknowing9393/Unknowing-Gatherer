@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.28.0
+ * thelounge-plugin-seedrpg-gathering  v0.29.0
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -18,6 +18,27 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.29.0 Specialty mode picks its daily second activity more carefully: it
+ *          first checks !daily (the game's own daily-task list) for an open
+ *          task on one of the other activities that awards FL tokens, since
+ *          gathering itself never grants FL (highest FL wins on a tie), then
+ *          falls back to plain round-robin. Either candidate is only used if
+ *          it actually leaves minSpecialtySecondaryMs (1h) of gathering time
+ *          after real travel is estimated -- otherwise every other activity
+ *          is tried in turn, and whichever leaves the most time wins, with a
+ *          warning if even the best one falls short (e.g. suggesting a lower
+ *          specialize percent or bigger budget). Previously a same-day pick
+ *          that turned out to be far away could silently leave a handful of
+ *          minutes after hours of travel. The rotation cursor advances past
+ *          whichever activity actually gets used either way. An FL tie
+ *          between activities is broken by estimated travel TIME (not raw
+ *          tile distance -- learned speed varies node to node) from the
+ *          day's starting position, not just whichever !daily happened to
+ *          list first. All of specialty's travel/time math is now computed only
+ *          after startDailyFromKnownPosition settles where the day actually
+ *          starts (home after a recall, or the last known position) --
+ *          previously it ran first, off whatever this.lastPos was left over
+ *          from the last thing that happened.
  *   0.28.0 "daily" is simplified to a single wall-clock time budget --
  *          "daily 10h [at 02:00]" is now the only way to configure it, with
  *          every activity sharing that budget equally by default. The old
@@ -147,7 +168,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.28.0";
+const VERSION = "0.29.0";
 
 const fs = require("fs");
 const path = require("path");
@@ -192,6 +213,29 @@ function resolveActivity(name) {
 const TAG_TO_ACTIVITY = {};
 for (const [act, meta] of Object.entries(ACTIVITIES)) {
 	TAG_TO_ACTIVITY[meta.tag] = act;
+}
+
+// activity -> words that identify it in a !daily task's free-text
+// description (e.g. "Chop 6 Elm logs", "Land a legendary-quality fish").
+// Built only from names already defined above (the activity itself, its
+// skill name, and any alias pointing to it) rather than guessed synonyms,
+// since a wrong invented keyword would misfire silently.
+const ACTIVITY_KEYWORDS = {};
+for (const [act, meta] of Object.entries(ACTIVITIES)) {
+	ACTIVITY_KEYWORDS[act] = new Set([act, meta.skill]);
+}
+for (const [alias, act] of Object.entries(ACTIVITY_ALIASES)) {
+	if (ACTIVITY_KEYWORDS[act]) ACTIVITY_KEYWORDS[act].add(alias);
+}
+
+/** Which of our 6 activities (if any) a !daily task's description is about. */
+function matchActivity(desc) {
+	for (const [act, words] of Object.entries(ACTIVITY_KEYWORDS)) {
+		for (const w of words) {
+			if (new RegExp(`\\b${w}\\b`, "i").test(desc)) return act;
+		}
+	}
+	return null;
 }
 
 const CONFIG = {
@@ -288,6 +332,12 @@ const CONFIG = {
 	// Below this much gathering per stop, the trip is mostly walking and the
 	// schedule needs explicit confirmation.
 	minGatherPerStopMs: 30 * 60000,
+
+	// Specialty mode's secondary activity should get at least this much
+	// gathering time -- otherwise a same-day rotation/FL pick that turns out
+	// to be far away can leave it a token few minutes, which isn't worth the
+	// trip. Other candidates are tried before accepting less than this.
+	minSpecialtySecondaryMs: 60 * 60000,
 
 	// While a schedule is waiting to be accepted, nag every this often between
 	// the UTC day rollover and the cycle's start time.
@@ -579,6 +629,41 @@ function parseEquippedSlot(line) {
 	}
 
 	return {slot: m[1], id: null};
+}
+
+/**
+ * Reads one "[DAILY]" task-list line into its open tasks, e.g.:
+ *   Nick: Smelt 3 batches of Iron ingots (0/3) - 918.62 MiB | Chop 6 Elm
+ *   logs (0/6) - 3.13 GiB + 1 FL | Forge a legendary item ✓ - 11.46 GiB + 2 FL
+ *
+ * Each "|"-separated task is "<description> (<done>/<total>)? - <reward>".
+ * A task missing the "(done/total)" fraction has already been completed
+ * (shown with a checkmark there instead) and is reported complete.
+ *
+ * Returns [{desc, complete, fl}], or null for a non-task-list [DAILY] line
+ * (e.g. "Completed: X" or "Day N: ...", which carry the same tag).
+ */
+function parseDailyTasks(line) {
+	const body = String(line).replace(RE.tag, "").replace(/^\S+:\s*/, "");
+	if (!body.includes(" | ") && !/\(\d+\/\d+\)/.test(body)) return null;
+
+	const tasks = [];
+	for (const chunk of body.split(/\s*\|\s*/)) {
+		const m = chunk.match(/^(.*?)\s*(?:\((\d+)\/(\d+)\))?\s*-\s*(.+)$/);
+		if (!m) continue;
+
+		const done = m[2] ? parseInt(m[2], 10) : null;
+		const total = m[3] ? parseInt(m[3], 10) : null;
+		const fl = m[4].match(/\+\s*(\d+)\s*FL\b/i);
+
+		tasks.push({
+			desc: m[1].trim(),
+			complete: done === null ? true : done >= total,
+			fl: fl ? parseInt(fl[1], 10) : 0,
+		});
+	}
+
+	return tasks.length ? tasks : null;
 }
 
 /**
@@ -1603,8 +1688,20 @@ class Session {
 	 * When specialty mode is on, replaces today's plan with just two stops:
 	 * the specialty activity gets `pct` of the day's gathering time (budget
 	 * minus travel estimated for these two specifically), the rest goes to
-	 * whichever other activity is next in rotation -- so every activity
-	 * still gets covered eventually without doing all of them daily.
+	 * a second activity -- so every activity still gets covered eventually
+	 * without doing all of them daily.
+	 *
+	 * That second activity is chosen by trying, in order: (1) an open !daily
+	 * task on one of the other activities that awards FL tokens, since
+	 * gathering itself never grants FL (highest FL wins on a tie), then
+	 * (2) plain rotation starting from the cursor. Each candidate is tried
+	 * for real (its actual travel cost estimated) and the first one that
+	 * leaves at least minSpecialtySecondaryMs of gathering time is used --
+	 * otherwise whichever candidate came closest is used anyway, with a
+	 * warning, since a same-day pick can turn out to be much farther away
+	 * than the one it replaced. The rotation cursor advances past whichever
+	 * activity actually gets used, same as if it had won its turn fairly.
+	 *
 	 * Returns false (and leaves the plan untouched) if there's no budget to
 	 * split, since a specialty split has nothing to work from otherwise.
 	 */
@@ -1617,35 +1714,120 @@ class Session {
 		}
 
 		const others = Object.keys(ACTIVITIES).filter((a) => a !== activity);
-		const idx = (this.daily.specialtyCursor || 0) % others.length;
-		const secondary = others[idx];
-		this.daily.specialtyCursor = idx + 1;
-		this.persistDaily();
+		const startIdx = (this.daily.specialtyCursor || 0) % others.length;
+		const rotationOrder = others.map((_, i) => others[(startIdx + i) % others.length]);
 
-		// Equal placeholder shares just to learn the route/travel cost for
-		// these two stops -- overwritten below with the real weighted split.
-		this.daily.plan = {[activity]: {kind: "share"}, [secondary]: {kind: "share"}};
-
-		let est = null;
+		let flPick = null;
 		try {
-			est = await this.estimateDaily(this.lastPos || this.home());
+			const lines = await this.ask("!daily", null, CONFIG.invCollectMs);
+			const byAct = new Map();   // activity -> highest FL reward seen for it
+
+			for (const line of lines) {
+				const tasks = parseDailyTasks(line);
+				if (!tasks) continue;
+
+				for (const t of tasks) {
+					if (t.complete || !t.fl) continue;
+					const act = matchActivity(t.desc);
+					if (!act || !others.includes(act)) continue;
+					if (!byAct.has(act) || t.fl > byAct.get(act)) byAct.set(act, t.fl);
+				}
+			}
+
+			if (byAct.size) {
+				const maxFl = Math.max(...byAct.values());
+				const tied = [...byAct.entries()].filter(([, fl]) => fl === maxFl).map(([act]) => act);
+
+				if (tied.length === 1) {
+					flPick = {act: tied[0], fl: maxFl};
+				} else {
+					// Equal FL reward on more than one activity -- break the tie
+					// by actual estimated travel TIME from where the day is
+					// starting, not raw tile distance, since learned per-node
+					// speed varies a lot (roads run 1-5 tiles/step, off-road
+					// always 1) -- the closer-looking node in tiles is not
+					// always the faster one to reach.
+					let bestAct = tied[0], bestMs = Infinity;
+					for (const act of tied) {
+						const node = await this.pickNode(act, {quiet: true});
+						const pos = node ? this.nodePos(act, node.name) : null;
+						const ms = pos && this.lastPos
+							? travelEstimate(manhattan(this.lastPos, pos), this.nodeSpeed(act, node.name)).ms
+							: Infinity;
+						if (ms < bestMs) {
+							bestMs = ms;
+							bestAct = act;
+						}
+					}
+					flPick = {act: bestAct, fl: maxFl};
+				}
+			}
 		} catch (err) {
-			est = null;
+			// Fall back to plain rotation if !daily couldn't be read.
 		}
 
-		const travel = est ? est.estTravel : 0;
-		const spare = Math.max(this.daily.budget - travel, CONFIG.minShareMs * 2);
-		const specialtyMs = Math.max(Math.floor(spare * pct), CONFIG.minShareMs);
-		const secondaryMs = Math.max(Math.floor(spare * (1 - pct)), CONFIG.minShareMs);
+		const tryOrder = flPick
+			? [flPick.act, ...rotationOrder.filter((a) => a !== flPick.act)]
+			: rotationOrder;
+
+		// Try each candidate for real until one clears the minimum, keeping
+		// whichever scored best in case none do.
+		let chosen = null;
+		let best = null;
+
+		for (const cand of tryOrder) {
+			this.daily.plan = {[activity]: {kind: "share"}, [cand]: {kind: "share"}};
+
+			let est = null;
+			try {
+				est = await this.estimateDaily(this.lastPos || this.home());
+			} catch (err) {
+				est = null;
+			}
+
+			const travel = est ? est.estTravel : 0;
+			const spare = Math.max(this.daily.budget - travel, 0);
+			const result = {
+				act: cand,
+				travel,
+				specialtyMs: Math.max(Math.floor(spare * pct), CONFIG.minShareMs),
+				secondaryMs: Math.max(Math.floor(spare * (1 - pct)), CONFIG.minShareMs),
+			};
+
+			if (!best || result.secondaryMs > best.secondaryMs) best = result;
+			if (result.secondaryMs >= CONFIG.minSpecialtySecondaryMs) {
+				chosen = result;
+				break;
+			}
+		}
+
+		const final = chosen || best;
+		const secondary = final.act;
+
+		if (flPick && flPick.act === secondary) {
+			this.say(`!daily task on ${secondary} awards +${flPick.fl} FL -- jumping it in today.`);
+		}
+		if (!chosen) {
+			this.say(
+				`Warning: even the best option (${secondary}) only leaves ${fmt(final.secondaryMs)} ` +
+				`after ~${fmt(final.travel)} travel -- consider a lower ${CMD} daily specialize ` +
+				`percent, a bigger ${CMD} daily budget, or fewer stops overall.`
+			);
+		} else if (secondary !== tryOrder[0]) {
+			this.say(`Skipped ${tryOrder[0]} today -- not enough time after travel; using ${secondary} instead.`);
+		}
+
+		this.daily.specialtyCursor = others.indexOf(secondary) + 1;
+		this.persistDaily();
 
 		this.daily.plan = {
-			[activity]: {kind: "time", value: specialtyMs},
-			[secondary]: {kind: "time", value: secondaryMs},
+			[activity]: {kind: "time", value: final.specialtyMs},
+			[secondary]: {kind: "time", value: final.secondaryMs},
 		};
 
 		this.say(
-			`Specialty today: ${activity} ${fmt(specialtyMs)} (${Math.round(pct * 100)}%) + ` +
-			`${secondary} ${fmt(secondaryMs)} (${Math.round((1 - pct) * 100)}%) -- ~${fmt(travel)} travel.`
+			`Specialty today: ${activity} ${fmt(final.specialtyMs)} (${Math.round(pct * 100)}%) + ` +
+			`${secondary} ${fmt(final.secondaryMs)} (${Math.round((1 - pct) * 100)}%) -- ~${fmt(final.travel)} travel.`
 		);
 		return true;
 	}
@@ -1742,21 +1924,32 @@ class Session {
 		this.dailyStartedAt = Date.now();
 		this.armDaily();        // schedule the next slot before the work begins
 
-		(async () => {
-			if (this.daily.specialty) {
-				const ok = await this.buildSpecialtyPlan();
-				if (!ok) {
-					this.dailyRunActive = false;
-					return;
-				}
-			}
+		// Recall home first so the route plans from a known origin -- but
+		// only if a teleport is actually held. Without one, !recall does
+		// nothing and planning from "home" would be planning from somewhere
+		// we are not. Specialty mode's plan is built after this resolves
+		// (see planDailyOrSpecialty), so its travel estimate is based on
+		// wherever the day is actually starting from, not stale state left
+		// over from the last thing that happened.
+		this.startDailyFromKnownPosition();
+	}
 
-			// Recall home first so the route plans from a known origin -- but
-			// only if a teleport is actually held. Without one, !recall does
-			// nothing and planning from "home" would be planning from
-			// somewhere we are not.
-			this.startDailyFromKnownPosition();
-		})();
+	/**
+	 * Builds the specialty plan (if any) using the now-settled starting
+	 * position, then hands off to planDaily. Must only be called once
+	 * startDailyFromKnownPosition has resolved whether today starts from
+	 * home or from the last known position -- calling it any earlier would
+	 * estimate specialty's travel split from stale state.
+	 */
+	async planDailyOrSpecialty() {
+		if (this.daily.specialty) {
+			const ok = await this.buildSpecialtyPlan();
+			if (!ok) {
+				this.dailyRunActive = false;
+				return;
+			}
+		}
+		await this.planDaily();
 	}
 
 	/**
@@ -1796,7 +1989,7 @@ class Session {
 					`stops will run in declared order.`);
 			}
 
-			this.planDaily();
+			await this.planDailyOrSpecialty();
 			return;
 		}
 
@@ -1833,7 +2026,7 @@ class Session {
 						`Recall ${desc} -- ` +
 						`routing from current position ${from[0]},${from[1]} instead.`
 					);
-					this.planDaily();
+					await this.planDailyOrSpecialty();
 					return;
 				}
 
@@ -1874,7 +2067,7 @@ class Session {
 				this.say(`Could not read !home -- using stored ${this.lastPos[0]},${this.lastPos[1]}.`);
 			}
 
-			this.planDaily();
+			await this.planDailyOrSpecialty();
 		}, CONFIG.recallMs);
 	}
 
