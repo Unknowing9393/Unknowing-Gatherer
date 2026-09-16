@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.29.1
+ * thelounge-plugin-seedrpg-gathering  v0.30.0
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -18,6 +18,20 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.30.0 Every town ever set as home is now remembered permanently (name
+ *          -> coordinates), not just the current one -- !home only ever
+ *          reports the currently-active town's location, so this is the
+ *          only way to learn others (passively, as home gets switched over
+ *          time). Between every queued stop, the plugin now checks whether
+ *          switching home to a different known town and recalling there
+ *          would reach the next stop faster than walking from here -- not
+ *          just the current home, since whichever town is quickest can
+ *          change stop to stop. Gated by the same recall savings threshold
+ *          as the start-of-day recall decision. Switching home has no cost
+ *          of its own, so this is purely a travel-time trade. Home is
+ *          switched back to whatever it was before the detour
+ *          (homeRestoreDelayMs, 5m) after the last such detour, in the
+ *          background -- does not delay the gathering that follows.
  *   0.29.1 Fixed "<activity> gear" never matching any equipped item: the
  *          real !inv output indents each slot line with leading spaces
  *          ("  Weapon: ..."), which the parser's anchored regex didn't
@@ -172,7 +186,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.29.1";
+const VERSION = "0.30.0";
 
 const fs = require("fs");
 const path = require("path");
@@ -292,6 +306,11 @@ const CONFIG = {
 
 	// Grace period after !recall before we start issuing gathering commands.
 	recallMs: 60000,
+
+	// How long a between-stop detour (switch home, recall, gather) waits
+	// before switching home back to whatever it was before the detour --
+	// runs in the background, does not delay the gathering that follows.
+	homeRestoreDelayMs: 5 * 60000,
 
 	// Consumable that !recall spends. Matched case-insensitively against the
 	// !inv consumables listing.
@@ -911,6 +930,10 @@ function manhattan(a, b) {
 	return Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
 }
 
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Distance in coordinate units -> estimated travel time, given a ms/unit
  * rate. Pass the destination node's own learned rate when known (see
@@ -969,6 +992,8 @@ class Session {
 
 		this.lastPos = null;   // most recent coordinates seen
 		this.lastNodeLevel = null;   // level of the last node a run was sent to
+		this.homeRestoreOriginal = null;   // home town to restore after a between-stop detour
+		this.homeRestoreTimer = null;
 		this.finishers = [];   // [{kind, arg}] run after the daily cycle
 		this.gear = {};        // activity -> [item id, ...] equipped before that activity's runs
 
@@ -1442,11 +1467,25 @@ class Session {
 		m.home = coords;
 		if (town) m.homeTown = town;
 		if (available && available.length) m.towns = available;
+
+		// Coordinates are only ever reported for whichever town is CURRENTLY
+		// home -- this is the only chance to learn one, so every town ever
+		// set as home is remembered permanently, not just the latest.
+		if (town && coords) {
+			if (!m.knownTowns) m.knownTowns = {};
+			m.knownTowns[town] = coords;
+		}
+
 		writeJson(MAP_FILE, m);
 	}
 
 	homeTown() {
 		return this.mapStore().homeTown || null;
+	}
+
+	/** Every town whose coordinates have been learned (from having been home at some point), name -> [x, y]. */
+	knownTowns() {
+		return this.mapStore().knownTowns || {};
 	}
 
 	/**
@@ -2738,6 +2777,78 @@ class Session {
 		);
 	}
 
+	/**
+	 * Before starting the next queued stop, checks whether switching home to
+	 * a different known town and recalling there would reach it faster than
+	 * walking from here -- not just the current home, since whichever town
+	 * is quickest can change stop to stop. Switching home has no cost of its
+	 * own, so this is purely a travel-time comparison, gated by the same
+	 * savings threshold as the start-of-day recall decision.
+	 */
+	async maybeRecallForNextStop(next) {
+		if (!next || !next.node || next.node === AUTO || next.activity === "grind") return;
+		if (!this.lastPos) return;
+
+		// Daily-plan stops queue the node's ID (what the game command actually
+		// takes -- see planDaily), but positions are keyed by name, so the
+		// resolved node object (set alongside .node there) is the one to use
+		// when present; a manually-queued run's .node is already the name.
+		const nodeName = next.resolved ? next.resolved.name : next.node;
+		const nextPos = this.nodePos(next.activity, nodeName);
+		if (!nextPos) return;
+
+		let stock = null;
+		try {
+			stock = await this.recallStock();
+		} catch (err) {
+			stock = null;
+		}
+		if (!stock) return;
+
+		const speed = this.nodeSpeed(next.activity, nodeName);
+		const directMs = travelEstimate(manhattan(this.lastPos, nextPos), speed).ms;
+		if (directMs <= 0) return;
+
+		let best = null;
+		for (const [town, coords] of Object.entries(this.knownTowns())) {
+			const ms = travelEstimate(manhattan(coords, nextPos), speed).ms;
+			if (!best || ms < best.ms) best = {town, coords, ms};
+		}
+		if (!best) return;
+
+		const savings = (directMs - best.ms) / directMs;
+		if (savings < this.recallThreshold()) return;
+
+		this.say(
+			`Recall to ${best.town} cuts travel to the next stop by ${Math.round(savings * 100)}% ` +
+			`(>= ${Math.round(this.recallThreshold() * 100)}% threshold) -- switching home and recalling.`
+		);
+
+		const switching = best.town !== this.homeTown();
+		if (switching) {
+			// Remember the town this detour is leaving, not whatever an
+			// earlier detour left home as -- otherwise a second detour before
+			// the first restores would "restore" to the wrong place.
+			if (this.homeRestoreOriginal === null) this.homeRestoreOriginal = this.homeTown();
+			this.send(`!home ${best.town}`);
+			await sleep(CONFIG.minGapMs);
+		}
+		this.send("!recall");
+		await sleep(CONFIG.recallMs);
+		this.lastPos = best.coords;
+
+		if (switching && this.homeRestoreOriginal) {
+			if (this.homeRestoreTimer) clearTimeout(this.homeRestoreTimer);
+			const original = this.homeRestoreOriginal;
+			this.homeRestoreTimer = setTimeout(() => {
+				this.homeRestoreTimer = null;
+				this.homeRestoreOriginal = null;
+				this.send(`!home ${original}`);
+				this.say(`Restored home to ${original} after the detour.`);
+			}, CONFIG.homeRestoreDelayMs);
+		}
+	}
+
 	advance() {
 		if (this.halted) return;
 		this.adaptRemaining();
@@ -2753,7 +2864,11 @@ class Session {
 			return;
 		}
 
-		this.startRun(this.queue.shift());
+		const next = this.queue.shift();
+		(async () => {
+			await this.maybeRecallForNextStop(next);
+			this.startRun(next);
+		})();
 	}
 
 	async startRun(run) {
@@ -3832,9 +3947,13 @@ module.exports = {
 							(async () => {
 								const h = await s.fetchHome();
 								if (h) {
+									const known = Object.keys(s.knownTowns());
 									s.say(`Home: ${h.town} (${h.coords[0]},${h.coords[1]})` +
 										(h.available.length > 1
 											? ` | available: ${h.available.join(", ")}`
+											: "") +
+										(known.length > 1
+											? ` | known coords: ${known.join(", ")}`
 											: ""));
 								} else {
 									const c = s.home();

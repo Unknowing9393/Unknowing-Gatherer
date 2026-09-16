@@ -10,7 +10,7 @@ It registers the command `/unkgather`, aliased to the shorter `/unkg`. Everythin
 - Unattended **daily cycle**: runs every gathering skill once a day, auto-picks the highest node your level allows, and routes stops by learned travel distance
 - Wall-clock budgets that divide travel-aware, with warnings (and required acceptance) for schedules that are mostly walking
 - Learns node positions and per-step travel time from real runs — no manual map data needed
-- `!recall` is only used when it actually saves a meaningful chunk of travel (configurable threshold)
+- `!recall` is only used when it actually saves a meaningful chunk of travel (configurable threshold) -- and between every stop, not just home, it checks every known town for whichever gets there fastest
 - Persistent per-day statistics, queryable with `/unkg stats`
 - Post-cycle actions: set a waypoint, queue a gauntlet, start a dungeon, or deposit loot once gathering finishes
 - Hardcore recovery (home, recall, re-equip) on a `[HARDCORE]`-tagged death, on by default
@@ -125,6 +125,8 @@ A daily cycle starts with `!recall` + `!home` to establish a known starting poin
 /unkg daily recall <pct>    # only recall if it saves >= pct% of route travel (default 25%)
 /unkg daily recall default  # reset to the 25% default
 ```
+
+The plugin also remembers every town it's ever seen set as home -- `!home` only ever reports the currently-active one, so this builds up passively over time as home actually gets switched, not all at once. Between every queued stop (not just at the start of the day), it checks whether switching home to a different known town and recalling there would reach the *next* stop faster than walking there from wherever you currently are -- whichever town is quickest can change from stop to stop. Switching home has no cost of its own, so this is purely a travel-time trade, gated by the same recall percentage above. Whatever home was before the first such detour is remembered, and switched back to five minutes after the *last* one -- in the background, so it doesn't delay the gathering that follows. `/unkg home` (no argument) shows which towns have known coordinates so far.
 
 If the last node worked today needs more SUR (from `!stats`) than you have plus a safety margin, the mobs guarding it are assumed too dangerous to linger near, so a `!deposit` + unconditional `!recall` run automatically before any post-cycle actions below:
 
