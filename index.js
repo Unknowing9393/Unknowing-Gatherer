@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.30.0
+ * thelounge-plugin-seedrpg-gathering  v0.30.1
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -18,6 +18,9 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.30.1 "<activity>" (bare) now shows its saved gear loadout, if any, and
+ *          "<activity> gear clear" removes it -- previously there was no way
+ *          to see or undo what "<activity> gear" had saved.
  *   0.30.0 Every town ever set as home is now remembered permanently (name
  *          -> coordinates), not just the current one -- !home only ever
  *          reports the currently-active town's location, so this is the
@@ -186,7 +189,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.30.0";
+const VERSION = "0.30.1";
 
 const fs = require("fs");
 const path = require("path");
@@ -3228,7 +3231,9 @@ function helpLines() {
 		`  ${CMD} resume                 :un-halt after a blocked state`,
 		`  ${CMD} hardcore on|off        :on a [HARDCORE] death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equip best (on by default)`,
 		`  ${CMD} hunt gear               :snapshot currently equipped gear (!inv) as the hunt loadout`,
-		"       Also: mine|chop|salvage|forage|fish|grind gear. Saved loadout is !equip'd before each run of that activity.",
+		`  ${CMD} hunt                    :show the saved hunt loadout, if any`,
+		`  ${CMD} hunt gear clear         :remove it`,
+		"       Also: mine|chop|salvage|forage|fish|grind. Saved loadout is !equip'd before each run of that activity.",
 		`  ${CMD} loot                   :session totals (since last restart)`,
 		`  ${CMD} stats                  :today's totals per activity`,
 		`  ${CMD} stats yesterday        :also: week, all, days, YYYY-MM-DD`,
@@ -3387,8 +3392,26 @@ module.exports = {
 						const activity = sub;
 						const action = (rest || "").trim().toLowerCase();
 
+						if (!action || action === "show") {
+							const ids = s.gear[activity];
+							s.say(ids && ids.length
+								? `${activity} loadout (${ids.length}/${GEAR_SLOTS.length} slots): ${ids.join(", ")}`
+								: `No ${activity} loadout saved. ${CMD} ${activity} gear to snapshot your current gear.`);
+							break;
+						}
+
+						if (action === "clear" || action === "off" || action === "none") {
+							const had = Boolean(s.gear[activity]);
+							delete s.gear[activity];
+							s.persistGear();
+							s.say(had ? `${activity} loadout cleared.` : `No ${activity} loadout was saved.`);
+							break;
+						}
+
 						if (action !== "gear") {
-							s.say(`Usage: ${CMD} ${activity} gear   :snapshot currently equipped gear as the ${activity} loadout`);
+							s.say(`Usage: ${CMD} ${activity}             show the saved loadout, if any`);
+							s.say(`       ${CMD} ${activity} gear        snapshot currently equipped gear as the ${activity} loadout`);
+							s.say(`       ${CMD} ${activity} gear clear  remove it`);
 							break;
 						}
 

@@ -199,6 +199,11 @@ Stand next to (or already be running) an activity and snapshot your currently eq
 
 This reads `!inv`'s default view (one line per equip slot, the `[E]`-flagged item's `#id`) and saves all 16 slots' item ids. From then on, every time that activity's queue starts a run, the plugin sends `!equip <id1> <id2> ...` first, so gear swaps automatically per activity -- useful if, say, hunting wants a combat-heavy set and mining doesn't need one at all.
 
+```
+/unkg hunt              # show the saved loadout, if any
+/unkg hunt gear clear   # remove it
+```
+
 ## Notes
 
 - Time formats accepted everywhere: `45s`, `10m`, `1h30m`, `04:30`. Node names with spaces are fine unquoted.
