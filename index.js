@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.30.1
+ * thelounge-plugin-seedrpg-gathering  v0.30.2
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -18,6 +18,12 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.30.2 The between-stop recall check (see 0.30.0) now logs a
+ *          "[recall-check] ..." line under /unkg debug for every stop --
+ *          why it skipped, or the direct-vs-best-town time comparison and
+ *          the decision -- since previously it stayed completely silent
+ *          whenever it decided not to recall, with no way to confirm it was
+ *          actually running each time.
  *   0.30.1 "<activity>" (bare) now shows its saved gear loadout, if any, and
  *          "<activity> gear clear" removes it -- previously there was no way
  *          to see or undo what "<activity> gear" had saved.
@@ -189,7 +195,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.30.1";
+const VERSION = "0.30.2";
 
 const fs = require("fs");
 const path = require("path");
@@ -2789,8 +2795,16 @@ class Session {
 	 * savings threshold as the start-of-day recall decision.
 	 */
 	async maybeRecallForNextStop(next) {
-		if (!next || !next.node || next.node === AUTO || next.activity === "grind") return;
-		if (!this.lastPos) return;
+		const dbg = (msg) => { if (this.debug) this.say(`[recall-check] ${msg}`); };
+
+		if (!next || !next.node || next.node === AUTO || next.activity === "grind") {
+			dbg(`skip -- ${!next ? "no next run" : next.activity === "grind" ? "grind has no node" : "node not yet resolved (auto)"}`);
+			return;
+		}
+		if (!this.lastPos) {
+			dbg("skip -- current position unknown");
+			return;
+		}
 
 		// Daily-plan stops queue the node's ID (what the game command actually
 		// takes -- see planDaily), but positions are keyed by name, so the
@@ -2798,7 +2812,10 @@ class Session {
 		// when present; a manually-queued run's .node is already the name.
 		const nodeName = next.resolved ? next.resolved.name : next.node;
 		const nextPos = this.nodePos(next.activity, nodeName);
-		if (!nextPos) return;
+		if (!nextPos) {
+			dbg(`skip -- ${next.activity} ${nodeName} has no known position`);
+			return;
+		}
 
 		let stock = null;
 		try {
@@ -2806,20 +2823,34 @@ class Session {
 		} catch (err) {
 			stock = null;
 		}
-		if (!stock) return;
+		if (!stock) {
+			dbg(`skip -- no ${CONFIG.recallItem} held (${stock === null ? "unknown" : "0"})`);
+			return;
+		}
 
 		const speed = this.nodeSpeed(next.activity, nodeName);
 		const directMs = travelEstimate(manhattan(this.lastPos, nextPos), speed).ms;
-		if (directMs <= 0) return;
+		if (directMs <= 0) {
+			dbg(`skip -- already at ${next.activity} ${nodeName}`);
+			return;
+		}
 
 		let best = null;
 		for (const [town, coords] of Object.entries(this.knownTowns())) {
 			const ms = travelEstimate(manhattan(coords, nextPos), speed).ms;
 			if (!best || ms < best.ms) best = {town, coords, ms};
 		}
-		if (!best) return;
+		if (!best) {
+			dbg("skip -- no known towns to recall to yet");
+			return;
+		}
 
 		const savings = (directMs - best.ms) / directMs;
+		dbg(
+			`${next.activity} ${nodeName}: direct ${fmt(directMs)} vs ${best.town} ${fmt(best.ms)} ` +
+			`(${Math.round(savings * 100)}% saved, need ${Math.round(this.recallThreshold() * 100)}%)` +
+			(savings < this.recallThreshold() ? " -- staying put" : " -- recalling")
+		);
 		if (savings < this.recallThreshold()) return;
 
 		this.say(
