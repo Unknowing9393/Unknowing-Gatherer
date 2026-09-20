@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.30.2
+ * thelounge-plugin-seedrpg-gathering  v0.30.3
  *
  * Drives SeedRPG gathering activities from The Lounge. Activities tick
  * continuously until stopped, so runs are bounded by time, success count, or
@@ -18,6 +18,13 @@
  *   /unkgather rotate forage 3 for 10m | mine 2 x25
  *
  * Changelog
+ *   0.30.3 Removed the "blocked" halt entirely -- gathering has no energy or
+ *          storage cap and cannot kill you, so nothing it matched ("cannot",
+ *          "not enough", ...) was a real stop condition, and a mob's flavor
+ *          text ("CRITICAL PROCESS: ... cannot be killed") halted the whole
+ *          queue. Death is now watched only by hardcore recovery: a normal
+ *          death is ignored, and a [HARDCORE] one stops the run and recovers
+ *          only while "hardcore" is on. "resume" is now only needed after that.
  *   0.30.2 The between-stop recall check (see 0.30.0) now logs a
  *          "[recall-check] ..." line under /unkg debug for every stop --
  *          why it skipped, or the direct-vs-best-town time comparison and
@@ -195,7 +202,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.30.2";
+const VERSION = "0.30.3";
 
 const fs = require("fs");
 const path = require("path");
@@ -405,10 +412,9 @@ const RE = {
 	started: /^(?:\S+:\s*)?Started\s+([a-z]+)\s+at\s+(.+?)\s*[!.]?\s*$/i,
 	// [FISHING] Nick: Fishing Lv3 (609xp) | Not fishing
 	statusLine: /^(?:\S+:\s*)?([A-Za-z]+)\s+Lv\s*(\d+)\s*\((\d+)\s*xp\)\s*\|\s*(.+)$/i,
-	blocked: /\b(inventory (?:is )?full|not enough|too tired|no (?:energy|stamina)|you (?:have )?died|cannot|unable to)\b/i,
 };
 
-/** Returns {tag, activity, success, xp, qty, quality, item, levelUp, blocked} */
+/** Returns {tag, activity, success, xp, qty, quality, item, levelUp} */
 function parseLine(line) {
 	const out = {raw: line};
 	const tagMatch = line.match(RE.tag);
@@ -508,8 +514,6 @@ function parseLine(line) {
 			if (out.qty === undefined) out.qty = parseInt(it[1], 10);
 		}
 	}
-
-	if (RE.blocked.test(out.body)) out.blocked = true;
 
 	return out;
 }
@@ -1068,7 +1072,6 @@ class Session {
 			if (p.success) bits.push(`HIT +${p.xp}xp`);
 			if (p.item) bits.push(`${p.qty}x ${p.item}`);
 			if (p.levelUp) bits.push(`LEVEL ${p.levelUp.level}`);
-			if (p.blocked) bits.push("BLOCK");
 			this.say(`[${bits.join(" ")}] ${line}`);
 		}
 
@@ -1078,21 +1081,18 @@ class Session {
 			return;
 		}
 
+		// Nothing here can halt a run on its own: gathering has no energy or
+		// storage cap and cannot kill you. Death is watched only for hardcore
+		// recovery -- a normal death is ignored, and a [HARDCORE] one (gear
+		// scattered to a dungeon) recovers only while that is switched on.
 		if (p.death) {
-			this.halted = line;
-			if (this.current) this.stopCurrent(`halted: ${line}`);
-
-			// A normal death changes nothing beyond the halt above -- only a
-			// [HARDCORE] death (which scatters equipped gear to a dungeon)
-			// warrants automatic recovery, and even that only unless the user
-			// has explicitly turned it off (see hardcoreRecover/CONFIG.hardcore).
-			if (p.hardcoreDeath) {
-				this.say(this.hardcore
-					? `Hardcore death detected -- ${line}`
-					: `Hardcore death detected -- ${line} (recovery off, resume manually)`);
-				if (this.hardcore) this.hardcoreRecover();
-			} else {
-				this.say(`Death detected -- ${line} (not hardcore, resume manually)`);
+			if (p.hardcoreDeath && this.hardcore) {
+				this.halted = line;
+				if (this.current) this.stopCurrent(`halted: ${line}`);
+				this.say(`Hardcore death detected -- ${line}`);
+				this.hardcoreRecover();
+			} else if (this.debug) {
+				this.say(`[death] ignored (${p.hardcoreDeath ? "hardcore recovery off" : "not hardcore"}): ${line}`);
 			}
 			return;
 		}
@@ -1145,12 +1145,6 @@ class Session {
 				if (this.current) this.current.xp += p.loot.xp;
 				if (this.debug) this.say(`[loot] ${p.loot.qty}x ${p.loot.item} +${p.loot.xp}xp`);
 			}
-			return;
-		}
-
-		if (p.blocked && this.current) {
-			this.halted = line;
-			this.stopCurrent(`halted: ${line}`);
 			return;
 		}
 
@@ -3259,7 +3253,7 @@ function helpLines() {
 		"CONTROL",
 		`  ${CMD} skip                   :abandon current run, start next`,
 		`  ${CMD} stop                   :stop everything, clear queue`,
-		`  ${CMD} resume                 :un-halt after a blocked state`,
+		`  ${CMD} resume                 :un-halt after a hardcore death`,
 		`  ${CMD} hardcore on|off        :on a [HARDCORE] death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equip best (on by default)`,
 		`  ${CMD} hunt gear               :snapshot currently equipped gear (!inv) as the hunt loadout`,
 		`  ${CMD} hunt                    :show the saved hunt loadout, if any`,

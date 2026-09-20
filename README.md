@@ -167,7 +167,7 @@ Map and home:
 ```
 /unkg skip      # abandon the current run, start the next queued one
 /unkg stop      # stop everything, clear the queue
-/unkg resume    # un-halt after a blocked state (inventory full, death, etc.)
+/unkg resume    # un-halt after a hardcore death
 /unkg loot      # session totals since the last restart
 /unkg stats [yesterday|week|all|days|YYYY-MM-DD]
 /unkg debug     # echo every DM line with its parse (handy for troubleshooting)
@@ -176,13 +176,13 @@ Map and home:
 
 ## Hardcore mode
 
-Every `[DEATH]` line halts anything currently running (won't auto-resume the queue) -- that part always happens. But a `[HARDCORE]`-tagged death (the game scatters your equipped items to a dungeon) also triggers automatic recovery by default:
+Nothing halts a run on its own -- gathering has no energy or storage cap and can't kill you. Death is watched only for hardcore recovery: a `[HARDCORE]`-tagged death (the game scatters your equipped items to a dungeon) stops what's running (it won't auto-resume the queue) and triggers automatic recovery by default:
 
 1. Sets your home town to SeedHaven
 2. Recalls there
 3. Re-equips your best gear once
 
-A normal (non-hardcore) death does nothing beyond the halt. On by default and persists across Lounge restarts -- turn it off with:
+A normal (non-hardcore) death is ignored, and so is a hardcore one while recovery is off. On by default and persists across Lounge restarts -- turn it off with:
 
 ```
 /unkg hardcore off
