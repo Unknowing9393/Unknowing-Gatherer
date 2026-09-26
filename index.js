@@ -1,199 +1,28 @@
 "use strict";
 
 /**
- * thelounge-plugin-seedrpg-gathering  v0.30.3
+ * thelounge-plugin-seedrpg-gathering  v1.1.0
  *
- * Drives SeedRPG gathering activities from The Lounge. Activities tick
- * continuously until stopped, so runs are bounded by time, success count, or
- * xp -- this plugin issues the start, counts ticks, issues the stop, and moves
- * to the next queued run.
+ * A passive, read-only monitor for SeedRPG gathering. It watches DMs from
+ * the game bot and tracks hits/xp/loot and learned node positions -- it
+ * never sends anything to the game itself. Start/stop/control your own
+ * gathering in-game as you normally would; this only listens.
  *
  * Registers /unkgather (alias /unkg). Run "/unkgather help" for the full list.
  *
- *   /unkgather on
- *   /unkgather q forage 3 for 10m   run !forage 3 for ten minutes
- *   /unkgather q mine 2 x25         run !mine 2 until 25 successful actions
- *   /unkgather q chop 1 until 500xp run !chop 1 until 500xp gained
- *   /unkgather q grind at 500 500 for 30m  waypoint there, time only
- *   /unkgather rotate forage 3 for 10m | mine 2 x25
- *
  * Changelog
- *   0.30.3 Removed the "blocked" halt entirely -- gathering has no energy or
- *          storage cap and cannot kill you, so nothing it matched ("cannot",
- *          "not enough", ...) was a real stop condition, and a mob's flavor
- *          text ("CRITICAL PROCESS: ... cannot be killed") halted the whole
- *          queue. Death is now watched only by hardcore recovery: a normal
- *          death is ignored, and a [HARDCORE] one stops the run and recovers
- *          only while "hardcore" is on. "resume" is now only needed after that.
- *   0.30.2 The between-stop recall check (see 0.30.0) now logs a
- *          "[recall-check] ..." line under /unkg debug for every stop --
- *          why it skipped, or the direct-vs-best-town time comparison and
- *          the decision -- since previously it stayed completely silent
- *          whenever it decided not to recall, with no way to confirm it was
- *          actually running each time.
- *   0.30.1 "<activity>" (bare) now shows its saved gear loadout, if any, and
- *          "<activity> gear clear" removes it -- previously there was no way
- *          to see or undo what "<activity> gear" had saved.
- *   0.30.0 Every town ever set as home is now remembered permanently (name
- *          -> coordinates), not just the current one -- !home only ever
- *          reports the currently-active town's location, so this is the
- *          only way to learn others (passively, as home gets switched over
- *          time). Between every queued stop, the plugin now checks whether
- *          switching home to a different known town and recalling there
- *          would reach the next stop faster than walking from here -- not
- *          just the current home, since whichever town is quickest can
- *          change stop to stop. Gated by the same recall savings threshold
- *          as the start-of-day recall decision. Switching home has no cost
- *          of its own, so this is purely a travel-time trade. Home is
- *          switched back to whatever it was before the detour
- *          (homeRestoreDelayMs, 5m) after the last such detour, in the
- *          background -- does not delay the gathering that follows.
- *   0.29.1 Fixed "<activity> gear" never matching any equipped item: the
- *          real !inv output indents each slot line with leading spaces
- *          ("  Weapon: ..."), which the parser's anchored regex didn't
- *          allow for, so every line failed to match.
- *   0.29.0 Specialty mode picks its daily second activity more carefully: it
- *          first checks !daily (the game's own daily-task list) for an open
- *          task on one of the other activities that awards FL tokens, since
- *          gathering itself never grants FL (highest FL wins on a tie), then
- *          falls back to plain round-robin. Either candidate is only used if
- *          it actually leaves minSpecialtySecondaryMs (1h) of gathering time
- *          after real travel is estimated -- otherwise every other activity
- *          is tried in turn, and whichever leaves the most time wins, with a
- *          warning if even the best one falls short (e.g. suggesting a lower
- *          specialize percent or bigger budget). Previously a same-day pick
- *          that turned out to be far away could silently leave a handful of
- *          minutes after hours of travel. The rotation cursor advances past
- *          whichever activity actually gets used either way. An FL tie
- *          between activities is broken by estimated travel TIME (not raw
- *          tile distance -- learned speed varies node to node) from the
- *          day's starting position, not just whichever !daily happened to
- *          list first. All of specialty's travel/time math is now computed only
- *          after startDailyFromKnownPosition settles where the day actually
- *          starts (home after a recall, or the last known position) --
- *          previously it ran first, off whatever this.lastPos was left over
- *          from the last thing that happened.
- *   0.28.0 "daily" is simplified to a single wall-clock time budget --
- *          "daily 10h [at 02:00]" is now the only way to configure it, with
- *          every activity sharing that budget equally by default. The old
- *          per-activity clauses ("all for 1h", "<act> for X", "<act> off",
- *          "within Xh, fish off", xN/until-Nxp limits) are gone; travel got
- *          too expensive as more of the map unlocked to keep running every
- *          activity daily, which this doesn't fix by itself -- "specialize"
- *          below does. New: "daily specialize <activity> [pct]" (default
- *          75%) makes that activity the bulk of every day's budget, with
- *          one other activity rotating in daily for the remainder, cycling
- *          through all of them over time instead of running all six daily.
- *          "daily specialize off" reverts to the equal split.
- *   0.27.1 Grind now falls back to "!equip best" when no "grind gear" loadout
- *          is saved, instead of equipping nothing -- unlike the gathering
- *          activities, it's pure combat, so something should always be on.
- *   0.27.0 "grind" is now queueable: "q grind at <x> <y> for <time>" sends
- *          !waypoint <x> <y>, waits for it to be confirmed and then for
- *          [MOVE] to report within grindArriveSteps (10) of the target, and
- *          only then starts the (time-only) clock. Ends with "!waypoint
- *          clear" instead of "!<activity> stop", since neither a start nor
- *          a stop command actually exists for it -- also supports "grind
- *          gear" like the gathering activities.
- *   0.26.0 Per-activity gear loadouts: "<activity> gear" (hunt|mine|chop|
- *          salvage|forage|fish) reads !inv's default view, saves every
- *          [E]-flagged slot's item id, and "!equip"s that full loadout
- *          before each future run of that activity.
- *   0.25.1 Fixed the re-equip command: the game's actual syntax is
- *          "!equip best" (two words), not "!equipbest" -- both the
- *          end-of-cycle re-equip and hardcore recovery were sending the
- *          invalid one-word form since it was first introduced.
- *   0.25.0 Node selection now breaks same-level ties by distance instead of
- *          list order -- previously an equally-eligible node hours away
- *          could be picked over one standing right next to you. Applies to
- *          the live daily pick (pickNode) and the "daily no" optimizer.
- *   0.24.0 Hardcore recovery is now on by default and only fires for a death
- *          actually carrying the game's own [HARDCORE] tag (equipped items
- *          scattered to a dungeon) -- a normal death still halts the queue
- *          but no longer needs "hardcore on" to have ever been run.
- *          "hardcore off" opts back out. Every [DEATH], hardcore or not,
- *          still halts and requires an explicit "resume".
- *   0.23.0 "!equipbest" now always runs at the very end of the daily cycle,
- *          after any safety deposit/recall and before configured "after"
- *          actions, so gear is optimal regardless of where the day ends.
- *   0.22.0 "after deposit" secures loot once the queue drains. If the day's
- *          last node's level outguns SUR (from !stats) by more than the
- *          safety margin, a deposit + unconditional recall now run
- *          automatically first, before any configured "after" actions --
- *          configurable with "daily safety <levels>" (default 5).
- *   0.21.0 Travel time is now learned per node (real ms per coordinate unit
- *          from actual trips) instead of assuming a fixed tiles-per-step
- *          rate -- speed depends on region and road level (1-5 tiles/step
- *          on roads, always 1 off-road), which no single constant can
- *          represent. Unwalked legs fall back to the 1 tile/step worst case.
- *   0.20.0 "hardcore on|off": on [DEATH], reset home to SeedHaven, recall,
- *          and re-equip once. Persists across restarts and self-attaches.
- *   0.19.0 "daily nodes" previews the node each activity would use, and flags
- *          level-eligible nodes whose position is still unmapped.
- *   0.18.2 "daily now" also accepts "start" as an alias.
- *   0.18.1 "daily now" runs the cycle immediately, any time, without waiting
- *          for the scheduled UTC slot.
- *   0.18.0 !recall now costs a consumable, so it is only used when the route
- *          from home beats the route from the current position by enough --
- *          configurable with "daily recall <pct>" (default 25%).
- *   0.17.0 When no shorter route exists: report the best available option and
- *          offer ignore budget|travel|minimum, or adapt to re-divide the
- *          window from travel measured during the run.
- *   0.16.0 "daily no" searches for a shorter route, trading node level for
- *          travel time only as far as needed to clear the thresholds.
- *   0.15.2 Reminders now state the travel cost (known vs assumed) and the
- *          gathering time it leaves per activity.
- *   0.15.1 Remind every 30m from 00:00 UTC until the cycle's start time while
- *          a warned-about schedule is still unaccepted.
- *   0.15.0 Warn and require explicit acceptance when a schedule leaves under
- *          30m gathering per stop, or spends more time travelling than
- *          gathering.
- *   0.14.1 Daily cycle skips activities whose node is not yet mapped, so the
- *          route and budget are not thrown off by an unroutable stop.
- *   0.14.0 "daily within 10h" -- give a wall-clock budget and let the plugin
- *          subtract estimated travel and split the rest across activities.
- *   0.13.0 Per-activity daily limits: "all for 1h, fish for 15m, hunt off".
- *   0.12.1 Gauntlets always queue solo.
- *   0.12.0 Optional post-cycle actions: set a waypoint, queue a gauntlet, or
- *          start a dungeon once the daily gathering finishes.
- *   0.11.2 With no recall item, read the real position from !stats instead of
- *          trusting the remembered one.
- *   0.11.1 Sum duplicate consumable stacks -- the same item appears several
- *          times in one listing.
- *   0.11.0 Check !inv consumables for a recall item before the daily cycle;
- *          without one, route from last known position instead of assuming
- *          we teleported home.
- *   0.10.3 Drop mid-cycle re-routing -- positions are only learned on arrival,
- *          so it could not improve the order of stops still ahead.
- *   0.10.1 Record partial work from manually stopped or skipped runs too.
- *   0.10.0 Persistent per-day statistics: every finished run is recorded to
- *          disk by UTC day and queryable with /unkgather stats.
- *   0.9.3  Anchor the !home parser on its real format; capture the discovered
- *          town list.
- *   0.9.2  Read home from the game with !home instead of a fixed constant, so
- *          it keeps working as new towns are discovered.
- *   0.9.1  Daily cycle opens with !recall so routes plan from a known origin.
- *   0.9.0  Learn node coordinates from travel and order the daily cycle by
- *          proximity. Adds /unkgather map.
- *   0.8.0  Daily cycle: run every gathering activity once a day at a chosen
- *          UTC time, sharing one limit. Survives a Lounge restart.
- *   0.7.2  Remove all stall detection. Count/xp runs now arm no timer at all.
- *   0.7.1  Remove the travel stall guard entirely -- travel cannot stall, so
- *          the guard only ever fired falsely and cancelled the trip.
- *   0.7.0  Register as /unkgather (alias /unkg) instead of /seed; add a help
- *          subcommand.
- *   0.6.1  Auto-attach the listener for commands that need it; never send a
- *          bare "!<activity>" as a start (it is a status query); detect the
- *          status reply so a failed start reports immediately.
- *   0.6.0  Model the queue -> travel -> gather sequence. The run clock now
- *          starts on arrival at the node, not on DM's acknowledgement, so
- *          travel time is no longer billed against the run's limit.
- *   0.5.0  Gate run start on DM's "Started <x> at <node>!" confirmation;
- *          verify the confirmed node against the auto-picked one.
- *   0.4.0  Exclude [LOOT] and [MOVE] background events from tick counting.
- *   0.3.0  Auto-select the highest node allowed by !skills level.
- *   0.2.0  Time / hit-count / xp run limits, rotations, loot tallying.
- *   0.1.0  Command scaffold and DM privmsg listener.
+ *   1.1.0 /unkg stats now breaks results down by node, not just activity --
+ *         stored as store[day][activity][node] instead of one bucket per
+ *         activity. Old history (a flat bucket per activity, no node) still
+ *         reads back fine, folded in as a single "unknown" node.
+ *   1.0.0 Reworked from an automation plugin (queued runs, a daily cycle,
+ *         auto-equip, auto-recall, ...) into a pure observer: the game's
+ *         rules no longer allow sending automated commands, so every
+ *         feature that sent one is gone. What's left reuses the same line
+ *         parsing this plugin already knew (tags, xp/loot patterns, node
+ *         lists, !skills, "Started X at Y!") to keep tracking stats and
+ *         node positions from whatever you do manually. See git history
+ *         for the previous automation design.
  */
 
 const PLUGIN_NAME = "seedrpg-gathering";
@@ -202,7 +31,7 @@ const PLUGIN_NAME = "seedrpg-gathering";
 const COMMAND = "unkgather";
 const ALIASES = ["unkg"];
 const CMD = "/" + COMMAND;
-const VERSION = "0.30.3";
+const VERSION = "1.1.0";
 
 const fs = require("fs");
 const path = require("path");
@@ -219,16 +48,6 @@ const ACTIVITIES = {
 	forage:  {noun: "nodes", tag: "FORAGING",    stat: "FOR", skill: "foraging"},
 	hunt:    {noun: "nodes", tag: "HUNTING",     stat: "HUN", skill: "hunting"},
 };
-
-// Everything !skills reports, for display purposes.
-const STAT_NAMES = {
-	OFF: "offense", DEF: "defense", EXP: "expertise", SUR: "survival", LCK: "luck",
-	FSH: "fishing", MIN: "mining", WDC: "woodcutting", SAL: "salvaging",
-	FOR: "foraging", HUN: "hunting", COOK: "cooking",
-	CRF: "crafting", DNG: "dungeoneering", ARN: "arena",
-};
-
-const AUTO = "auto";
 
 // Alternative names people reach for.
 const ACTIVITY_ALIASES = {
@@ -249,143 +68,12 @@ for (const [act, meta] of Object.entries(ACTIVITIES)) {
 	TAG_TO_ACTIVITY[meta.tag] = act;
 }
 
-// activity -> words that identify it in a !daily task's free-text
-// description (e.g. "Chop 6 Elm logs", "Land a legendary-quality fish").
-// Built only from names already defined above (the activity itself, its
-// skill name, and any alias pointing to it) rather than guessed synonyms,
-// since a wrong invented keyword would misfire silently.
-const ACTIVITY_KEYWORDS = {};
-for (const [act, meta] of Object.entries(ACTIVITIES)) {
-	ACTIVITY_KEYWORDS[act] = new Set([act, meta.skill]);
-}
-for (const [alias, act] of Object.entries(ACTIVITY_ALIASES)) {
-	if (ACTIVITY_KEYWORDS[act]) ACTIVITY_KEYWORDS[act].add(alias);
-}
-
-/** Which of our 6 activities (if any) a !daily task's description is about. */
-function matchActivity(desc) {
-	for (const [act, words] of Object.entries(ACTIVITY_KEYWORDS)) {
-		for (const w of words) {
-			if (new RegExp(`\\b${w}\\b`, "i").test(desc)) return act;
-		}
-	}
-	return null;
-}
-
 const CONFIG = {
 	botNick: "DM",
-	minGapMs: 2500,          // floor between outbound commands
-	maxWaitMs: 6 * 3600000,  // ceiling on any single run
-	defaultLimit: {kind: "time", value: 10 * 60000},
 
-	// Which command reports skill levels. (!stats is player stats; !skills is levels.)
-	levelCommand: "!skills",
-
-	// How long to gather reply lines after asking DM a question.
-	collectMs: 4000,
-
-	// "!inv" spans one line per equip slot (16+) -- give it longer than the
-	// default collectMs so slower delivery doesn't truncate the listing.
-	invCollectMs: 8000,
-
-	// Re-use cached levels / node lists for this long before re-querying.
-	cacheMs: 5 * 60000,
-
-	// Auto-pick the highest eligible node when none is specified.
-	autoNode: true,
-
-	// How long to wait for "Started <x> at <node>!" before giving up on a run.
-	confirmMs: 25000,
-
-	// "grind" has no real start command -- it's just standing within this many
-	// steps of a waypoint with nothing else queued, which the game auto-fights.
-	// The timer starts once [MOVE] reports being this close.
-	grindArriveSteps: 10,
-
-	// The game day resets at 00:00 UTC, so the daily cycle defaults to just
-	// after the reset.
-	dailyDefaultUtcMinute: 5,
-
-	// Travel speed (ms per coordinate unit) depends on the region and road
-	// level along the way -- roads run anywhere from 1 to 5 tiles per ~67s
-	// step, and off-road is always 1 tile per step. There is no way to know a
-	// route's real speed without walking it, so each node's approach speed is
-	// learned from real runs (see rememberNode). This is only the
-	// conservative fallback for a node -- or leg -- never yet walked (worst
-	// case: 1 tile/step).
+	// Fallback only, for the ETA shown in "/unkg map" before a node's real
+	// travel speed has been learned from watching a real trip to it.
 	fallbackMsPerUnit: 67000,
-
-	// Fallback only. Home is normally read from the game with !home, which
-	// keeps working as more towns are discovered. Manual override:
-	// "<cmd> home <x>,<y>".
-	homeCoords: [0, 500],
-
-	// Grace period after !recall before we start issuing gathering commands.
-	recallMs: 60000,
-
-	// How long a between-stop detour (switch home, recall, gather) waits
-	// before switching home back to whatever it was before the detour --
-	// runs in the background, does not delay the gathering that follows.
-	homeRestoreDelayMs: 5 * 60000,
-
-	// Consumable that !recall spends. Matched case-insensitively against the
-	// !inv consumables listing.
-	recallItem: "home teleport",
-
-	// Actions that can run after the daily gathering cycle finishes. Each maps
-	// to the game command it issues; edit here if the syntax changes.
-	finishers: {
-		waypoint: (arg) => `!waypoint ${arg}`,
-		// Unattended runs are always solo -- no group to coordinate with.
-		gauntlet: (arg) => (arg ? `!gauntlet ${arg} solo` : "!gauntlet solo"),
-		dungeon: (arg) => (arg ? `!queue dungeon ${arg}` : "!queue dungeon"),
-		// Secures loot before any post-cycle idling near mobs that could kill
-		// and drop it -- put this first in the chain (e.g. "after deposit | waypoint town").
-		deposit: () => "!deposit",
-		// Not user-facing (not in parseFinisher) -- only used internally by the
-		// SUR safety check below, which needs an unconditional recall rather
-		// than the savings-gated one used before the daily cycle starts.
-		recall: () => "!recall",
-		// Not user-facing either -- always appended at cycle end (see
-		// runFinishers) so gear is optimal regardless of where the day ends.
-		equipbest: () => "!equip best",
-	},
-
-	// Gap between chained finisher commands.
-	finisherGapMs: 4000,
-
-	// If the last node gathered from today is more than this many levels above
-	// SUR (from !stats), its mobs are assumed too dangerous to linger near, so
-	// the cycle deposits loot and recalls home before any configured "after"
-	// actions run. Base guess -- widen or narrow as real risk becomes clearer.
-	survivalSafetyMargin: 5,
-
-	// Recalling home spends a consumable, so only do it when the route from
-	// home is at least this much shorter than the route from where we already
-	// are. Override per-network with "<cmd> daily recall <percent>".
-	recallSavingsThreshold: 0.25,
-
-	// Never allot less than this per stop when dividing a budget.
-	minShareMs: 5 * 60000,
-
-	// Below this much gathering per stop, the trip is mostly walking and the
-	// schedule needs explicit confirmation.
-	minGatherPerStopMs: 30 * 60000,
-
-	// Specialty mode's secondary activity should get at least this much
-	// gathering time -- otherwise a same-day rotation/FL pick that turns out
-	// to be far away can leave it a token few minutes, which isn't worth the
-	// trip. Other candidates are tried before accepting less than this.
-	minSpecialtySecondaryMs: 60 * 60000,
-
-	// While a schedule is waiting to be accepted, nag every this often between
-	// the UTC day rollover and the cycle's start time.
-	reminderEveryMs: 30 * 60000,
-
-	// Hardcore mode: town [DEATH] resets home to, before recalling there.
-	hardcoreHomeTown: "SeedHaven",
-
-
 };
 
 // ---------------------------------------------------------------------------
@@ -396,8 +84,9 @@ const CONFIG = {
 //   [FORAGING] Nick gathers 2x Wild Carrots. Farm to inventory. (2x standard) +35xp (base 35: Seedpool +1%)
 //   [LEVEL UP] Foraging reached level 4!  -  Nick reached microservice architecture of mind
 //
-// Flavor text is randomized and enormous, so we never match on it. A tick is a
-// success if it carries +Nxp.
+// Flavor text is randomized and enormous, so we never match on it. A tick is
+// a success if it carries +Nxp. None of this ever triggers an outbound
+// message -- it only classifies lines the game bot already sent.
 // ---------------------------------------------------------------------------
 
 const RE = {
@@ -410,11 +99,13 @@ const RE = {
 	loot:    /^(?:([a-z]+)\s+)?(.+?)\s+x(\d+)\s*\(\+(\d+)\s*xp\)/i,
 	// [FORAGING] Nick: Started foraging at Truffle Shuffle!
 	started: /^(?:\S+:\s*)?Started\s+([a-z]+)\s+at\s+(.+?)\s*[!.]?\s*$/i,
+	// [FISHING] Nick: Stopped fishing. 100 catches this session.
+	stopped: /^(?:\S+:\s*)?Stopped\s+([a-z]+)\b/i,
 	// [FISHING] Nick: Fishing Lv3 (609xp) | Not fishing
 	statusLine: /^(?:\S+:\s*)?([A-Za-z]+)\s+Lv\s*(\d+)\s*\((\d+)\s*xp\)\s*\|\s*(.+)$/i,
 };
 
-/** Returns {tag, activity, success, xp, qty, quality, item, levelUp} */
+/** Returns {tag, activity, success, xp, qty, quality, item, levelUp, death, move, loot, started, stopped, status} */
 function parseLine(line) {
 	const out = {raw: line};
 	const tagMatch = line.match(RE.tag);
@@ -433,31 +124,22 @@ function parseLine(line) {
 		return out;
 	}
 
-	// The game's own death signal. Matched on the tag, not on "you have died"
-	// text, so hardcore recovery never fires on an unrelated blocked line. A
-	// normal death and a hardcore one both carry [DEATH]; only a hardcore
-	// death also carries a separate [HARDCORE] tag inline in the body, e.g.
-	// "You were slain by X! [HARDCORE] Lost ... Your N equipped items were
-	// scattered to a dungeon." -- that inline tag is what actually matters.
+	// The game's own death signal. A normal death and a hardcore one both
+	// carry [DEATH]; only a hardcore death also carries a separate
+	// [HARDCORE] tag inline in the body, e.g. "You were slain by X!
+	// [HARDCORE] Lost ... Your N equipped items were scattered to a
+	// dungeon." Reported only -- nothing here can recover from it, since
+	// that would mean sending !home/!recall/!equip.
 	if (out.tag === "DEATH") {
 		out.death = true;
 		out.hardcoreDeath = /\[HARDCORE\]/.test(out.body);
 		return out;
 	}
 
-	// Travel. Not actionable in itself, but it marks the walk to a node, which
-	// must not be billed against the run's time limit.
+	// Travel. Not actionable in itself, but it marks the walk to a node,
+	// which must not be counted as a gathering tick.
 	if (out.tag === "MOVE") {
 		out.move = true;
-		const c = out.body.match(/\((\d+)\s*,\s*(\d+)\)/);
-		if (c) out.coords = [parseInt(c[1], 10), parseInt(c[2], 10)];
-		return out;
-	}
-
-	// "!waypoint x y" acknowledgement -- this is the only "start" signal a
-	// grind run gets, since there is no real command for grinding itself.
-	if (out.tag === "TRAVEL") {
-		out.travel = true;
 		const c = out.body.match(/\((\d+)\s*,\s*(\d+)\)/);
 		if (c) out.coords = [parseInt(c[1], 10), parseInt(c[2], 10)];
 		return out;
@@ -481,6 +163,12 @@ function parseLine(line) {
 	const st = out.body.match(RE.started);
 	if (st) {
 		out.started = {verb: st[1].toLowerCase(), node: st[2].trim()};
+		return out;
+	}
+
+	const sp = out.body.match(RE.stopped);
+	if (sp) {
+		out.stopped = {verb: sp[1].toLowerCase()};
 		return out;
 	}
 
@@ -526,7 +214,8 @@ function parseLine(line) {
 //   [MINING] Nodes: [1] Chris's Cache (coastal, Lv16+, standard) | [3] Mt Array (coastal, Lv1+, standard)
 //   Nick OFF:9 DEF:8 EXP:7 SUR:7 LCK:8 | FSH:3 MIN:7 WDC:6 SAL:4 FOR:4 HUN:3 COOK:4 | CRF:3 DNG:6 ARN:4
 //
-// Note the whole node list arrives on ONE line, pipe-separated.
+// Only ever seen in passing (from a command the player typed themselves) --
+// never requested. Note the whole node list arrives on ONE line, pipe-separated.
 // ---------------------------------------------------------------------------
 
 const RE_NODE_LIST = /\b(?:nodes|spots)\s*:/i;
@@ -558,7 +247,7 @@ function parseNodeList(line) {
 	return out;
 }
 
-/** Parses the !skills line into {FSH: 3, MIN: 7, ...}. */
+/** Parses a !skills line into {FSH: 3, MIN: 7, ...}. */
 function parseStats(line) {
 	const out = {};
 	let m;
@@ -573,31 +262,8 @@ function parseStats(line) {
 }
 
 // ---------------------------------------------------------------------------
-// Durations
+// Formatting / storage helpers
 // ---------------------------------------------------------------------------
-
-function toMs(n, unit) {
-	const v = parseInt(n, 10);
-	const u = String(unit).toLowerCase();
-	if (u.startsWith("h")) return v * 3600000;
-	if (u === "m" || u.startsWith("min")) return v * 60000;
-	if (u === "d") return v * 86400000;
-	return v * 1000;
-}
-
-function parseDuration(text) {
-	const t = String(text).trim();
-	const clock = t.match(/^(?:(\d+):)?(\d{1,2}):(\d{2})$/);
-	if (clock) {
-		const h = parseInt(clock[1] || "0", 10);
-		return ((h * 60 + parseInt(clock[2], 10)) * 60 + parseInt(clock[3], 10)) * 1000;
-	}
-	let total = 0;
-	const re = /(\d+)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/gi;
-	let m;
-	while ((m = re.exec(t)) !== null) total += toMs(m[1], m[2]);
-	return total;
-}
 
 function fmt(ms) {
 	if (ms <= 0) return "0s";
@@ -609,295 +275,10 @@ function fmt(ms) {
 	return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
 }
 
-/**
- * Reads an "!inv consumables" reply:
- *   Nick Consumables: 15xCrab Boil, 18xCaptain's Chowder, 5xHome Teleport, ...
- *
- * Entries are "<qty>x<Item>" with no space, comma separated. The same item can
- * appear several times (separate stacks), so quantities are summed rather than
- * taking the first match.
- *
- * Returns {held} for the named item, or null if this is not a consumables line.
- */
-function parseRecallStock(line, itemName) {
-	const body = String(line).replace(RE.tag, "");
-	if (!/\bconsumables\s*:/i.test(body)) return null;
-
-	const name = String(itemName || CONFIG.recallItem).toLowerCase();
-	const list = body.slice(body.search(/\bconsumables\s*:/i)).replace(/^[^:]*:/, "");
-
-	let held = 0;
-	let found = false;
-
-	for (const entry of list.split(",")) {
-		const m = entry.trim().match(/^(\d+)\s*x\s*(.+?)\s*$/i);
-		if (!m) continue;
-		if (m[2].toLowerCase() !== name) continue;
-		held += parseInt(m[1], 10);
-		found = true;
-	}
-
-	return found ? {held} : {held: 0};
-}
-
-/**
- * Reads one line of the default "!inv" reply, which lists one equip slot per
- * line, e.g.:
- *   Weapon: Skinning Sabre (5926/M) #4/4 [E] #5514282 | Felling Spear ...
- *   Shield: Tracking Kite Shield (398/M) #3/3 [E] #1571296 | Assaying ...
- *
- * Each candidate item is "|"-separated; the equipped one is flagged [E]
- * (always seen first in practice, but every chunk is checked in case that
- * ever changes) and its trailing "#<id>" is what "!equip <id>" takes.
- *
- * Returns {slot, id} (id null if nothing in that slot is flagged [E]), or
- * null if the line isn't a recognized gear slot at all.
- */
-function parseEquippedSlot(line) {
-	const body = String(line).replace(RE.tag, "");
-	const m = body.match(/^\s*([A-Za-z]+)\s*:\s*(.+)$/);
-	if (!m || !GEAR_SLOTS.includes(m[1])) return null;
-
-	for (const chunk of m[2].split(/\s*\|\s*/)) {
-		if (!/\[E\]/.test(chunk)) continue;
-		const id = chunk.match(/#(\d+)/);
-		return {slot: m[1], id: id ? id[1] : null};
-	}
-
-	return {slot: m[1], id: null};
-}
-
-/**
- * Reads one "[DAILY]" task-list line into its open tasks, e.g.:
- *   Nick: Smelt 3 batches of Iron ingots (0/3) - 918.62 MiB | Chop 6 Elm
- *   logs (0/6) - 3.13 GiB + 1 FL | Forge a legendary item ✓ - 11.46 GiB + 2 FL
- *
- * Each "|"-separated task is "<description> (<done>/<total>)? - <reward>".
- * A task missing the "(done/total)" fraction has already been completed
- * (shown with a checkmark there instead) and is reported complete.
- *
- * Returns [{desc, complete, fl}], or null for a non-task-list [DAILY] line
- * (e.g. "Completed: X" or "Day N: ...", which carry the same tag).
- */
-function parseDailyTasks(line) {
-	const body = String(line).replace(RE.tag, "").replace(/^\S+:\s*/, "");
-	if (!body.includes(" | ") && !/\(\d+\/\d+\)/.test(body)) return null;
-
-	const tasks = [];
-	for (const chunk of body.split(/\s*\|\s*/)) {
-		const m = chunk.match(/^(.*?)\s*(?:\((\d+)\/(\d+)\))?\s*-\s*(.+)$/);
-		if (!m) continue;
-
-		const done = m[2] ? parseInt(m[2], 10) : null;
-		const total = m[3] ? parseInt(m[3], 10) : null;
-		const fl = m[4].match(/\+\s*(\d+)\s*FL\b/i);
-
-		tasks.push({
-			desc: m[1].trim(),
-			complete: done === null ? true : done >= total,
-			fl: fl ? parseInt(fl[1], 10) : 0,
-		});
-	}
-
-	return tasks.length ? tasks : null;
-}
-
-/**
- * Reads the !stats reply, whose final field is the player's current position:
- *   Nick HP: 1300/1300 | Salvaging | striker | OFF:15 ... | online | (14, 481)
- *
- * Anchored on the HP field so nothing else can be mistaken for it.
- */
-function parseStatsLine(line) {
-	const body = String(line).replace(RE.tag, "");
-	if (!/\bHP\s*:\s*\d+/i.test(body)) return null;
-
-	const pos = body.match(/\((\d+)\s*,\s*(\d+)\)\s*$/);
-	const hp = body.match(/\bHP\s*:\s*(\d+)\s*\/\s*(\d+)/i);
-
-	// The field after HP is the current activity, or absent when idle.
-	const act = body.match(/\bHP\s*:\s*\d+\s*\/\s*\d+\s*\|\s*([A-Za-z]+)\s*\|/);
-	const doing = act ? act[1].toLowerCase() : null;
-
-	// Core stat block, e.g. "OFF:9 DEF:10 EXP:9 SUR:10 LCK:9" -- SUR is used
-	// as the yardstick for what combat a node's mobs can be handled at.
-	const sur = body.match(/\bSUR\s*:\s*(\d+)/i);
-
-	return {
-		coords: pos ? [parseInt(pos[1], 10), parseInt(pos[2], 10)] : null,
-		hp: hp ? [parseInt(hp[1], 10), parseInt(hp[2], 10)] : null,
-		activity: doing,
-		online: /\bonline\b/i.test(body),
-		sur: sur ? parseInt(sur[1], 10) : null,
-	};
-}
-
-/**
- * Parses the !home reply:
- *   Nick: Home is SeedHaven (180, 240). Set with !home <town>. Available: SeedHaven
- *
- * Anchored on "Home is" so a [MOVE] line -- which also carries coordinates --
- * can never be mistaken for it.
- */
-function parseHome(line) {
-	const body = String(line).replace(RE.tag, "");
-	const m = body.match(/\bHome is\s+(.+?)\s*\((\d+)\s*,\s*(\d+)\)/i);
-	if (!m) return null;
-
-	const avail = body.match(/\bAvailable:\s*(.+?)\s*$/i);
-
-	return {
-		town: m[1].trim(),
-		coords: [parseInt(m[2], 10), parseInt(m[3], 10)],
-		available: avail
-			? avail[1].split(/\s*[,|]\s*/).map((t) => t.trim()).filter(Boolean)
-			: [],
-	};
-}
-
-/** Minutes-after-UTC-midnight -> "02:05". */
-function fmtUtc(minutes) {
-	const h = Math.floor(minutes / 60), m = minutes % 60;
-	return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} UTC`;
-}
-
-/** "02:00" | "0200" | "2:00" -> minutes after UTC midnight, or null. */
-function parseUtcTime(text) {
-	const m = String(text).trim().match(/^(\d{1,2}):?(\d{2})$/);
-	if (!m) return null;
-	const h = parseInt(m[1], 10), min = parseInt(m[2], 10);
-	if (h > 23 || min > 59) return null;
-	return h * 60 + min;
-}
-
-/** Next UTC occurrence of a given minute-of-day, as a Date. */
-function nextUtcOccurrence(minutes) {
-	const now = new Date();
-	const next = new Date(Date.UTC(
-		now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
-		Math.floor(minutes / 60), minutes % 60, 0, 0
-	));
-	if (next.getTime() <= now.getTime()) next.setUTCDate(next.getUTCDate() + 1);
-	return next;
-}
-
-function describeLimit(limit) {
-	if (!limit) return "until stopped";
-	if (limit.kind === "share") return "share of budget";
-	if (limit.kind === "time") return `for ${fmt(limit.value)}`;
-	if (limit.kind === "count") return `${limit.value} hits`;
-	if (limit.kind === "xp") return `${limit.value}xp`;
-	return "until stopped";
-}
-
 function stripFormatting(str) {
 	// eslint-disable-next-line no-control-regex
 	return String(str).replace(/\x03(\d{1,2}(,\d{1,2})?)?|\x04[0-9a-fA-F]{6}|[\x00-\x1F]/g, "");
 }
-
-// ---------------------------------------------------------------------------
-// Run: one queued unit of work
-// ---------------------------------------------------------------------------
-
-class Run {
-	constructor(activity, node, limit) {
-		this.activity = activity;
-		this.node = node;
-		this.limit = limit || Object.assign({}, CONFIG.defaultLimit);
-		this.reset();
-	}
-
-	reset() {
-		this.state = "idle";        // idle -> pending -> traveling -> running
-		this.confirmedNode = null;
-		this.travelSteps = 0;
-		this.travelStartedAt = 0;
-		this.travelMs = 0;
-		this.travelFrom = null;
-		this.coords = null;
-		this.startedAt = 0;
-		this.lastTick = 0;
-		this.ticks = 0;
-		this.successes = 0;
-		this.xp = 0;
-		this.loot = new Map();
-	}
-
-	describe() {
-		const target = this.limit.kind === "time" ? `for ${fmt(this.limit.value)}`
-			: this.limit.kind === "count" ? `x${this.limit.value}`
-			: this.limit.kind === "xp" ? `until ${this.limit.value}xp`
-			: "until stopped";
-		const n = this.node === AUTO ? " [auto]" : this.node ? " " + this.node : "";
-		return `!${this.activity}${n} ${target}`;
-	}
-
-	/** How much of the limit is consumed, 0..1 (null = unbounded). */
-	progress() {
-		if (this.state !== "running") return 0;
-		if (this.limit.kind === "time") {
-			return (Date.now() - this.startedAt) / this.limit.value;
-		}
-		if (this.limit.kind === "count") return this.successes / this.limit.value;
-		if (this.limit.kind === "xp") return this.xp / this.limit.value;
-		return null;
-	}
-
-	isDone() {
-		const p = this.progress();
-		return p !== null && p >= 1;
-	}
-
-	/** ms until the time limit expires, or null for non-time limits. */
-	msRemaining() {
-		if (this.limit.kind !== "time") return null;
-		return Math.max(0, this.limit.value - (Date.now() - this.startedAt));
-	}
-
-	summary() {
-		const items = [...this.loot.entries()]
-			.sort((a, b) => b[1] - a[1])
-			.map(([name, n]) => `${n}x ${name}`)
-			.join(", ");
-		const elapsed = fmt(Date.now() - this.startedAt) +
-			(this.travelMs ? ` (+${fmt(this.travelMs)} travel)` : "");
-		const rate = this.ticks ? Math.round((this.successes / this.ticks) * 100) : 0;
-		return `!${this.activity}${this.confirmedNode ? " @ " + this.confirmedNode : ""} done: ` +
-			`${this.successes}/${this.ticks} hits (${rate}%), ` +
-			`+${this.xp}xp, ${elapsed}${items ? " -- " + items : ""}`;
-	}
-}
-
-/** Fresh Run with the same activity/node/limit -- used to repeat a rotation. Preserves grind's targetPos. */
-function cloneRun(r) {
-	const run = new Run(r.activity, r.node, r.limit);
-	if (r.targetPos) run.targetPos = r.targetPos;
-	return run;
-}
-
-// ---------------------------------------------------------------------------
-// Session: one per network
-// ---------------------------------------------------------------------------
-
-const sessions = new Map();
-
-// Set in onServerStart -- needed for the persistent storage path.
-let API = null;
-
-const DAILY_FILE = "unkgather-daily.json";
-const MAP_FILE = "unkgather-nodes.json";
-const STATS_FILE = "unkgather-stats.json";
-const HARDCORE_FILE = "unkgather-hardcore.json";
-const GEAR_FILE = "unkgather-gear.json";
-const STATS_KEEP_DAYS = 60;
-
-// Equip slots as !inv's default view lists them -- 10 shared combat slots
-// plus one gathering tool per activity (Axe/chop, Pick/mine, Rod/fish,
-// Cutter/salvage, Sickle/forage, Bow/hunt).
-const GEAR_SLOTS = [
-	"Weapon", "Shield", "Helm", "Armor", "Tunic", "Gloves", "Boots", "Amulet", "Ring", "Charm",
-	"Axe", "Pick", "Rod", "Cutter", "Sickle", "Bow",
-];
 
 /** UTC date key -- the game day resets at 00:00 UTC, so days are UTC days. */
 function utcDay(date) {
@@ -909,6 +290,30 @@ function dayOffset(days) {
 	d.setUTCDate(d.getUTCDate() + days);
 	return utcDay(d);
 }
+
+/** Grid distance between two [x, y] points. Movement is axis-aligned. */
+function manhattan(a, b) {
+	return Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
+}
+
+/**
+ * Distance in coordinate units -> estimated travel time, given a ms/unit
+ * rate learned from watching a real trip to that node (see
+ * Session#rememberNode); falls back to a conservative worst case otherwise.
+ * Only ever used for the "/unkg map" ETA display.
+ */
+function travelEstimate(units, msPerUnit) {
+	return {ms: Math.round(units * (msPerUnit || CONFIG.fallbackMsPerUnit))};
+}
+
+const sessions = new Map();
+
+// Set in onServerStart -- needed for the persistent storage path.
+let API = null;
+
+const MAP_FILE = "unkgather-nodes.json";
+const STATS_FILE = "unkgather-stats.json";
+const STATS_KEEP_DAYS = 60;
 
 function storeFile(name) {
 	try {
@@ -938,47 +343,45 @@ function writeJson(name, obj) {
 	}
 }
 
-/** Grid distance between two [x, y] points. Movement is axis-aligned. */
-function manhattan(a, b) {
-	return Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
+// ---------------------------------------------------------------------------
+// Watch: one activity session currently being observed
+// ---------------------------------------------------------------------------
+
+class Watch {
+	constructor(activity) {
+		this.activity = activity;
+		this.node = null;             // from "Started X at Y!"
+		this.state = "traveling";     // traveling -> running
+		this.travelFrom = null;
+		this.travelStartedAt = Date.now();
+		this.travelSteps = 0;
+		this.travelMs = 0;
+		this.coords = null;
+		this.startedAt = 0;
+		this.lastTick = 0;
+		this.ticks = 0;
+		this.successes = 0;
+		this.xp = 0;
+		this.loot = new Map();
+	}
+
+	summary() {
+		const items = [...this.loot.entries()]
+			.sort((a, b) => b[1] - a[1])
+			.map(([name, n]) => `${n}x ${name}`)
+			.join(", ");
+		const elapsed = fmt(Date.now() - this.startedAt) +
+			(this.travelMs ? ` (+${fmt(this.travelMs)} travel)` : "");
+		const rate = this.ticks ? Math.round((this.successes / this.ticks) * 100) : 0;
+		return `!${this.activity}${this.node ? " @ " + this.node : ""} stopped: ` +
+			`${this.successes}/${this.ticks} hits (${rate}%), ` +
+			`+${this.xp}xp, ${elapsed}${items ? " -- " + items : ""}`;
+	}
 }
 
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Distance in coordinate units -> estimated travel time, given a ms/unit
- * rate. Pass the destination node's own learned rate when known (see
- * Session#nodeSpeed); falls back to the conservative worst case otherwise.
- */
-function travelEstimate(units, msPerUnit) {
-	return {ms: Math.round(units * (msPerUnit || CONFIG.fallbackMsPerUnit))};
-}
-
-function readDailyStore() {
-	return readJson(DAILY_FILE, {});
-}
-
-function writeDailyStore(obj) {
-	writeJson(DAILY_FILE, obj);
-}
-
-function readHardcoreStore() {
-	return readJson(HARDCORE_FILE, {});
-}
-
-function writeHardcoreStore(obj) {
-	writeJson(HARDCORE_FILE, obj);
-}
-
-function readGearStore() {
-	return readJson(GEAR_FILE, {});
-}
-
-function writeGearStore(obj) {
-	writeJson(GEAR_FILE, obj);
-}
+// ---------------------------------------------------------------------------
+// Session: one per network
+// ---------------------------------------------------------------------------
 
 class Session {
 	constructor(network, client, chanId) {
@@ -986,41 +389,21 @@ class Session {
 		this.client = client;
 		this.chanId = chanId;
 
-		this.queue = [];
-		this.rotation = null;
-		this.current = null;
-		this.timer = null;
-		this.lastSend = 0;
-		this.halted = null;
-		this.debug = false;
-		this.hardcore = true;   // on by default -- only a [HARDCORE] death acts on it; "hardcore off" opts out
 		this.attached = false;
-		this.totals = {runs: 0, successes: 0, xp: 0, loot: new Map()};
-
-		this.daily = {enabled: false, atMin: CONFIG.dailyDefaultUtcMinute, plan: null, recallThreshold: null, survivalMargin: null, specialty: null, specialtyCursor: 0, lastRunDay: null};
-		this.dailyTimer = null;
-		this.reminderTimer = null;
-		this.pendingWarnings = null;
-		this.pendingSummary = null;
-
+		this.debug = false;
+		this.watch = null;
 		this.lastPos = null;   // most recent coordinates seen
-		this.lastNodeLevel = null;   // level of the last node a run was sent to
-		this.homeRestoreOriginal = null;   // home town to restore after a between-stop detour
-		this.homeRestoreTimer = null;
-		this.finishers = [];   // [{kind, arg}] run after the daily cycle
-		this.gear = {};        // activity -> [item id, ...] equipped before that activity's runs
 
-		this.levels = new Map();     // skill -> {level, at}
-		this.nodeCache = new Map();  // activity -> {nodes, at}
-		this.collector = null;       // active reply-gathering buffer
-		this.starting = false;       // guards against overlapping starts
+		this.totals = {runs: 0, successes: 0, xp: 0, loot: new Map()};
+		this.levels = new Map();     // stat -> {level, at} -- from the last !skills line seen
+		this.nodeCache = new Map();  // activity -> {nodes, at} -- from the last node list seen
 	}
 
 	say(text) {
 		this.client.sendMessage(text, this.chanId);
 	}
 
-	// -- wiring ------------------------------------------------------------
+	// -- wiring: purely local, never sends anything to the game -----------
 
 	attach() {
 		if (this.attached) return true;
@@ -1050,22 +433,13 @@ class Session {
 			irc.removeListener("notice", this.handler);
 		}
 		this.attached = false;
-		this.clearTimer();
 	}
 
-	// -- inbound -----------------------------------------------------------
+	// -- inbound -------------------------------------------------------------
 
 	onLine(line) {
 		if (!line.trim()) return;
 		const p = parseLine(line);
-
-		// While waiting on a reply to a question we asked, buffer everything.
-		if (this.collector) {
-			this.collector.lines.push(line);
-			if (this.debug) this.say(`[collect] ${line}`);
-			if (this.collector.until && this.collector.until(line)) this.collector.finish();
-			return;
-		}
 
 		if (this.debug) {
 			const bits = [p.tag || "-"];
@@ -1077,62 +451,21 @@ class Session {
 
 		if (p.levelUp) {
 			this.say(`Level up: ${p.levelUp.skill} -> ${p.levelUp.level}`);
-			this.levels.clear();   // re-query before the next auto pick
 			return;
 		}
 
-		// Nothing here can halt a run on its own: gathering has no energy or
-		// storage cap and cannot kill you. Death is watched only for hardcore
-		// recovery -- a normal death is ignored, and a [HARDCORE] one (gear
-		// scattered to a dungeon) recovers only while that is switched on.
+		// Reported only -- nothing recovers from this. Recovering would mean
+		// sending !home/!recall/!equip, which is exactly what is no longer
+		// allowed.
 		if (p.death) {
-			if (p.hardcoreDeath && this.hardcore) {
-				this.halted = line;
-				if (this.current) this.stopCurrent(`halted: ${line}`);
-				this.say(`Hardcore death detected -- ${line}`);
-				this.hardcoreRecover();
-			} else if (this.debug) {
-				this.say(`[death] ignored (${p.hardcoreDeath ? "hardcore recovery off" : "not hardcore"}): ${line}`);
-			}
-			return;
-		}
-
-		// The waypoint command's own acknowledgement -- the only "start" a
-		// grind run gets. A route through unmapped territory can print this
-		// twice (survey beacon consumed), so only the first, while still
-		// pending, actually begins the run.
-		if (p.travel) {
-			if (p.coords) this.lastPos = p.coords;
-			const r = this.current;
-			if (r && r.activity === "grind" && r.state === "pending") {
-				if (this.confirmTimer) {
-					clearTimeout(this.confirmTimer);
-					this.confirmTimer = null;
-				}
-				r.state = "traveling";
-				r.travelStartedAt = Date.now();
-				r.travelFrom = this.lastPos;
-				r.confirmedNode = r.node;
-				this.say(`Waypoint confirmed -- travelling to grind spot.`);
-			}
+			this.say(`Death detected${p.hardcoreDeath ? " [HARDCORE]" : ""} -- ${line}`);
 			return;
 		}
 
 		if (p.move) {
-			const r = this.current;
-			if (r && r.state === "traveling") {
-				r.travelSteps++;
-				r.lastProgress = Date.now();
-				if (p.coords) r.coords = p.coords;
-
-				if (r.activity === "grind" && r.targetPos && r.coords &&
-					manhattan(r.coords, r.targetPos) <= CONFIG.grindArriveSteps) {
-					r.travelMs = Date.now() - r.travelStartedAt;
-					r.state = "running";
-					r.startedAt = Date.now();
-					this.say(`Within ${CONFIG.grindArriveSteps} steps of the grind spot -- starting ${fmt(r.limit.value)} timer.`);
-					this.armTimer();
-				}
+			if (this.watch && this.watch.state === "traveling") {
+				this.watch.travelSteps++;
+				if (p.coords) this.watch.coords = p.coords;
 			}
 			if (p.coords) this.lastPos = p.coords;
 			return;
@@ -1142,184 +475,150 @@ class Session {
 			if (p.loot) {
 				this.totals.loot.set(p.loot.item, (this.totals.loot.get(p.loot.item) || 0) + p.loot.qty);
 				this.totals.xp += p.loot.xp;
-				if (this.current) this.current.xp += p.loot.xp;
+				if (this.watch) this.watch.xp += p.loot.xp;
 				if (this.debug) this.say(`[loot] ${p.loot.qty}x ${p.loot.item} +${p.loot.xp}xp`);
 			}
 			return;
 		}
 
-		const run = this.current;
-		if (!run) return;
-
-		// A status reply while we are waiting to start means the command did
-		// not begin anything. Fail now rather than after the timeout.
-		if (p.status) {
-			if (run.state === "pending" && p.activity === run.activity && p.status.idle) {
-				this.clearTimer();
-				this.say(`!${run.activity} did not start (${CONFIG.botNick} reports: ${p.status.state}) -- skipping.`);
-				this.current = null;
-				setTimeout(() => this.advance(), CONFIG.minGapMs);
-			}
-			return;
+		// Passive caching -- whatever a node list or !skills line the player's
+		// own commands turn up is remembered for display. Never asked for.
+		if (p.activity) {
+			const nodes = parseNodeList(line);
+			if (nodes.length) this.nodeCache.set(p.activity, {nodes, at: Date.now()});
+		}
+		const stats = parseStats(line);
+		if (stats) {
+			for (const [k, v] of Object.entries(stats)) this.levels.set(k, {level: v, at: Date.now()});
 		}
 
-		// Start confirmation: this is what actually begins the run.
+		if (p.status) return;   // reply to a bare "!<activity>" query, not a tick
+
 		if (p.started) {
-			if (run.state !== "pending") return;
-			if (p.activity !== run.activity) return;
-
-			if (this.confirmTimer) {
-				clearTimeout(this.confirmTimer);
-				this.confirmTimer = null;
-			}
-
-			// This is the acknowledgement, not arrival. The walk to the node
-			// comes next, and must not be billed against the run's limit.
-			run.state = "traveling";
-			run.confirmedNode = p.started.node;
-			run.travelStartedAt = Date.now();
-			run.lastProgress = Date.now();
-			run.travelFrom = this.lastPos;
-
-			const want = run.resolved && run.resolved.name;
-			const mismatch = want && want.toLowerCase() !== p.started.node.toLowerCase();
-
-			this.say(
-				`Queued ${p.started.node}` +
-				(mismatch ? ` (expected ${want})` : "") +
-				` -- travelling`
-			);
-
+			const activity = p.activity || resolveActivity(p.started.verb);
+			if (!activity) return;
+			if (this.watch) this.finishWatch("switched");
+			this.watch = new Watch(activity);
+			this.watch.node = p.started.node;
+			this.watch.travelFrom = this.lastPos;
+			this.say(`Watching !${activity} -- travelling to ${p.started.node}`);
 			return;
 		}
 
-		// Arrival. The first line tagged with our activity after the walk means
-		// we are at the node -- THIS is where the clock starts. The line itself
-		// is the "begins gathering" flavour, not a gather attempt, so it is not
-		// counted as a tick.
-		if (run.state === "traveling") {
-			if (!p.activity || p.activity !== run.activity) return;
-
-			run.travelMs = Date.now() - run.travelStartedAt;
-
-			// The last coordinates before arrival are effectively where this
-			// node lives. Learned once, reused to plan future routes.
-			if (run.coords && run.confirmedNode) {
-				this.rememberNode(run.activity, run.confirmedNode, run.coords,
-					run.travelSteps, run.travelMs, run.travelFrom);
-				this.lastPos = run.coords;
-			}
-			run.state = "running";
-			run.startedAt = Date.now();
-			run.lastTick = Date.now();
-
-			this.say(
-				`Arrived at ${run.confirmedNode}` +
-				(run.travelSteps ? ` (${run.travelSteps} steps, ${fmt(run.travelMs)})` : "") +
-				` -- running ${run.limit.kind === "time" ? fmt(run.limit.value)
-					: run.limit.kind === "count" ? run.limit.value + " hits"
-					: run.limit.value + "xp"}`
-			);
-
-			this.armTimer();
+		if (p.stopped) {
+			if (this.watch) this.finishWatch("stopped");
 			return;
 		}
 
-		// Nothing counts until we have arrived and the clock is going.
-		if (run.state !== "running") return;
+		// No "Started" line was seen for this (the plugin was turned on
+		// mid-session) -- pick it up in progress rather than miss it entirely.
+		if (!this.watch && p.activity && ACTIVITIES[p.activity] && p.success) {
+			this.watch = new Watch(p.activity);
+			this.watch.state = "running";
+			this.watch.startedAt = Date.now();
+			this.say(`Watching !${p.activity} (already in progress).`);
+		}
 
-		// Only lines tagged with the exact activity we started are ticks.
-		// Background events ([LOOT], [MOVE], dungeon chatter) are excluded, or
-		// they would inflate hit counts and satisfy x<N> limits spuriously.
-		if (!p.activity || p.activity !== run.activity) return;
+		const w = this.watch;
+		if (!w || w.activity !== p.activity) return;
 
-		run.ticks++;
-		run.lastTick = Date.now();
+		// Arrival. The first line tagged with our activity after the walk
+		// means we are at the node -- THIS is where the clock starts. The
+		// line itself is the "begins gathering" flavour, not a gather
+		// attempt, so it is not counted as a tick.
+		if (w.state === "traveling") {
+			w.travelMs = Date.now() - w.travelStartedAt;
+
+			if (w.coords) {
+				this.rememberNode(w.activity, w.node, w.coords, w.travelSteps, w.travelMs, w.travelFrom);
+				this.lastPos = w.coords;
+			}
+
+			w.state = "running";
+			w.startedAt = Date.now();
+			w.lastTick = Date.now();
+
+			this.say(
+				`Arrived at ${w.node}` +
+				(w.travelSteps ? ` (${w.travelSteps} steps, ${fmt(w.travelMs)})` : "") +
+				` -- watching`
+			);
+			return;
+		}
+
+		w.ticks++;
+		w.lastTick = Date.now();
 
 		if (p.success) {
-			run.successes++;
-			run.xp += p.xp || 0;
-			if (p.item) run.loot.set(p.item, (run.loot.get(p.item) || 0) + (p.qty || 1));
+			w.successes++;
+			w.xp += p.xp || 0;
+			if (p.item) w.loot.set(p.item, (w.loot.get(p.item) || 0) + (p.qty || 1));
 		}
-
-		if (run.isDone()) this.finishRun();
 	}
 
-	/**
-	 * Issues the configured post-cycle actions once the queue drains. Only
-	 * fires for a daily cycle, so ad-hoc queues are unaffected.
-	 *
-	 * Before those, checks whether the last node worked today outguns SUR by
-	 * more than the safety margin -- if so, a deposit and an unconditional
-	 * recall are inserted first, so lingering mobs cannot cost loot or a life.
-	 */
-	async runFinishers() {
-		if (!this.dailyRunActive) return;
-		this.dailyRunActive = false;
+	/** Finalizes the current watch: reports a summary and records it to per-day stats. */
+	finishWatch(reason) {
+		const w = this.watch;
+		this.watch = null;
+		if (!w) return;
 
-		const pre = [];
-		if (typeof this.lastNodeLevel === "number") {
-			let st = null;
-			try {
-				st = await this.fetchPosition();
-			} catch (err) {
-				st = null;
-			}
-
-			if (st && typeof st.sur === "number") {
-				const margin = this.survivalMargin();
-				const cap = st.sur + margin;
-				if (this.lastNodeLevel > cap) {
-					this.say(
-						`Finished on a Lv${this.lastNodeLevel} node vs SUR ${st.sur} ` +
-						`(+${margin} cap ${cap}) -- depositing and recalling first.`
-					);
-					pre.push({kind: "deposit", arg: null}, {kind: "recall", arg: null});
-				}
-			}
+		if (w.state !== "running") {
+			this.say(`Stopped watching !${w.activity} before arrival (${reason}).`);
+			return;
 		}
 
-		// Always re-equip best gear at the end of the cycle, regardless of
-		// where the day ends up or whether it was flagged risky.
-		pre.push({kind: "equipbest", arg: null});
+		this.say(`${w.summary()} (${reason})`);
 
-		const chain = pre.concat(this.finishers);
-		if (!chain.length) return;
+		if (w.ticks) this.recordWatch(w);
 
-		this.say(`Gathering done -- starting: ${chain.map(describeFinisher).join(", ")}`);
-
-		chain.forEach((f, i) => {
-			setTimeout(() => {
-				const build = CONFIG.finishers[f.kind];
-				if (build) this.send(build(f.arg));
-			}, i * CONFIG.finisherGapMs);
-		});
+		this.totals.runs++;
+		this.totals.successes += w.successes;
+		this.totals.xp += w.xp;
+		for (const [name, n] of w.loot) {
+			this.totals.loot.set(name, (this.totals.loot.get(name) || 0) + n);
+		}
 	}
 
-	// -- statistics ---------------------------------------------------------
+	// -- statistics -----------------------------------------------------------
 
-	recordRun(run) {
+	/** Fresh, empty per-node/activity stats bucket. */
+	emptyBucket() {
+		return {runs: 0, ticks: 0, hits: 0, xp: 0, gatherMs: 0, travelMs: 0, loot: {}};
+	}
+
+	addBucket(into, from) {
+		into.runs += from.runs;
+		into.ticks += from.ticks;
+		into.hits += from.hits;
+		into.xp += from.xp;
+		into.gatherMs += from.gatherMs;
+		into.travelMs += from.travelMs;
+		for (const [item, n] of Object.entries(from.loot || {})) {
+			into.loot[item] = (into.loot[item] || 0) + n;
+		}
+	}
+
+	/** Stored per day as store[day][activity][node] -- so results can be told apart by node. */
+	recordWatch(w) {
 		const store = readJson(STATS_FILE, {});
 		const day = utcDay();
+		const node = w.node || "unknown";
 
 		if (!store[day]) store[day] = {};
-		const bucket = store[day][run.activity] || {
-			runs: 0, ticks: 0, hits: 0, xp: 0,
-			gatherMs: 0, travelMs: 0, loot: {},
-		};
+		if (!store[day][w.activity]) store[day][w.activity] = {};
+		const bucket = store[day][w.activity][node] || this.emptyBucket();
 
 		bucket.runs += 1;
-		bucket.ticks += run.ticks;
-		bucket.hits += run.successes;
-		bucket.xp += run.xp;
-		bucket.gatherMs += Math.max(0, Date.now() - run.startedAt);
-		bucket.travelMs += run.travelMs || 0;
-		for (const [item, n] of run.loot) {
+		bucket.ticks += w.ticks;
+		bucket.hits += w.successes;
+		bucket.xp += w.xp;
+		bucket.gatherMs += Math.max(0, Date.now() - w.startedAt);
+		bucket.travelMs += w.travelMs || 0;
+		for (const [item, n] of w.loot) {
 			bucket.loot[item] = (bucket.loot[item] || 0) + n;
 		}
-		if (run.confirmedNode) bucket.lastNode = run.confirmedNode;
 
-		store[day][run.activity] = bucket;
+		store[day][w.activity][node] = bucket;
 
 		// Trim old days so the file cannot grow without bound.
 		const cutoff = dayOffset(-STATS_KEEP_DAYS);
@@ -1330,7 +629,12 @@ class Session {
 		writeJson(STATS_FILE, store);
 	}
 
-	/** Merges one or more day buckets into a single per-activity report. */
+	/**
+	 * Merges one or more day buckets into a per-activity report, each with a
+	 * per-node breakdown. Also reads the older flat "store[day][activity] =
+	 * bucket" shape (from before results were split out by node) as a single
+	 * node named "unknown", so past history still shows up.
+	 */
 	statsFor(days) {
 		const store = readJson(STATS_FILE, {});
 		const merged = {};
@@ -1338,22 +642,25 @@ class Session {
 		for (const day of days) {
 			const d = store[day];
 			if (!d) continue;
-			for (const [act, b] of Object.entries(d)) {
-				const m = merged[act] || {
-					runs: 0, ticks: 0, hits: 0, xp: 0,
-					gatherMs: 0, travelMs: 0, loot: {},
-				};
-				m.runs += b.runs;
-				m.ticks += b.ticks;
-				m.hits += b.hits;
-				m.xp += b.xp;
-				m.gatherMs += b.gatherMs;
-				m.travelMs += b.travelMs;
-				for (const [item, n] of Object.entries(b.loot || {})) {
-					m.loot[item] = (m.loot[item] || 0) + n;
+
+			for (const [act, byNodeOrBucket] of Object.entries(d)) {
+				if (!merged[act]) merged[act] = Object.assign(this.emptyBucket(), {byNode: {}});
+				const m = merged[act];
+
+				const byNode = typeof byNodeOrBucket.ticks === "number"
+					? {unknown: byNodeOrBucket}
+					: byNodeOrBucket;
+
+				for (const [node, b] of Object.entries(byNode)) {
+					if (!m.byNode[node]) m.byNode[node] = this.emptyBucket();
+					this.addBucket(m.byNode[node], b);
 				}
-				merged[act] = m;
 			}
+		}
+
+		for (const act of Object.keys(merged)) {
+			const m = merged[act];
+			for (const nb of Object.values(m.byNode)) this.addBucket(m, nb);
 		}
 
 		return merged;
@@ -1388,6 +695,20 @@ class Session {
 				(items ? `  ${items}` : "")
 			);
 
+			// Only worth a breakdown once more than one node contributed --
+			// otherwise it would just repeat the activity line above.
+			const nodes = Object.keys(m.byNode);
+			if (nodes.length > 1) {
+				nodes.sort((a, b) => m.byNode[b].xp - m.byNode[a].xp).forEach((node) => {
+					const nb = m.byNode[node];
+					const nRate = nb.ticks ? Math.round((nb.hits / nb.ticks) * 100) : 0;
+					this.say(
+						`      ${node.padEnd(24)} ${String(nb.hits).padStart(4)}/${String(nb.ticks).padEnd(5)} ` +
+						`${String(nRate).padStart(3)}%  ${String(nb.xp).padStart(6)}xp`
+					);
+				});
+			}
+
 			for (const k of Object.keys(tot)) tot[k] += m[k];
 		});
 
@@ -1412,19 +733,14 @@ class Session {
 		return `${activity}|${String(nodeName).toLowerCase()}`;
 	}
 
-	/** Learned ms per coordinate unit for the approach to this node, if known. */
-	nodeSpeed(activity, nodeName) {
-		const e = this.mapStore().nodes[this.mapKey(activity, nodeName)];
-		return (e && e.msPerUnit) || null;
-	}
-
 	/**
 	 * Records where a node is, learned from the last coords before arrival.
 	 * When the trip's starting point is also known, this measures that
 	 * approach's real ms-per-tile directly from distance covered and time
 	 * taken -- travel speed depends on the region and road level along the
 	 * way (roads run 1-5 tiles per step, off-road always 1), so it must be
-	 * observed per node rather than assumed from one global constant.
+	 * observed per node rather than assumed from one global constant. Purely
+	 * informational: nothing here ever plans or sends a route.
 	 */
 	rememberNode(activity, nodeName, coords, steps, ms, from) {
 		if (!coords || !nodeName) return;
@@ -1459,1729 +775,6 @@ class Session {
 
 		writeJson(MAP_FILE, m);
 	}
-
-	home() {
-		const m = this.mapStore();
-		return (m.home && m.home.length === 2) ? m.home : CONFIG.homeCoords;
-	}
-
-	setHome(coords, town, available) {
-		const m = this.mapStore();
-		m.home = coords;
-		if (town) m.homeTown = town;
-		if (available && available.length) m.towns = available;
-
-		// Coordinates are only ever reported for whichever town is CURRENTLY
-		// home -- this is the only chance to learn one, so every town ever
-		// set as home is remembered permanently, not just the latest.
-		if (town && coords) {
-			if (!m.knownTowns) m.knownTowns = {};
-			m.knownTowns[town] = coords;
-		}
-
-		writeJson(MAP_FILE, m);
-	}
-
-	homeTown() {
-		return this.mapStore().homeTown || null;
-	}
-
-	/** Every town whose coordinates have been learned (from having been home at some point), name -> [x, y]. */
-	knownTowns() {
-		return this.mapStore().knownTowns || {};
-	}
-
-	/**
-	 * Checks whether a recall consumable is available. Returns the count, 0 if
-	 * the listing was read and none were found, or null if the reply could not
-	 * be read at all (in which case the caller should not assume either way).
-	 */
-	async recallStock() {
-		const lines = await this.ask(
-			"!inv consumables",
-			(l) => parseRecallStock(l, CONFIG.recallItem) !== null
-		);
-
-
-		for (const l of lines) {
-			const r = parseRecallStock(l, CONFIG.recallItem);
-			if (r) return r.held;
-		}
-
-		// No consumables line was seen at all -- caller should not assume.
-		return null;
-	}
-
-	/**
-	 * Asks the game where we are. Authoritative, unlike the remembered
-	 * position, which may be stale after a restart or manual play.
-	 */
-	async fetchPosition() {
-		const lines = await this.ask("!stats", (l) => parseStatsLine(l) !== null);
-
-		for (const l of lines) {
-			const st = parseStatsLine(l);
-			if (st && st.coords) {
-				this.lastPos = st.coords;
-				return st;
-			}
-		}
-
-		return null;
-	}
-
-	/**
-	 * Asks the game where home is. Falls back to the stored value, then to the
-	 * configured default, so a parse failure degrades rather than breaks.
-	 */
-	async fetchHome() {
-		const lines = await this.ask("!home", (l) => parseHome(l) !== null);
-
-		for (const l of lines) {
-			const h = parseHome(l);
-			if (!h) continue;
-			this.setHome(h.coords, h.town, h.available);
-			return h;
-		}
-
-		return null;
-	}
-
-	nodePos(activity, nodeName) {
-		const e = this.mapStore().nodes[this.mapKey(activity, nodeName)];
-		return e ? [e.x, e.y] : null;
-	}
-
-	/**
-	 * Greedy nearest-neighbour ordering of planned stops, starting from our
-	 * current position. Stops with no known location go last, in given order.
-	 */
-	orderByProximity(stops, from) {
-		const known = stops.filter((s) => s.pos);
-		const unknown = stops.filter((s) => !s.pos);
-
-		const out = [];
-		let cur = from;
-
-		while (known.length) {
-			let bestIdx = 0;
-			if (cur) {
-				let bestDist = Infinity;
-				known.forEach((s, i) => {
-					const d = manhattan(cur, s.pos);
-					if (d < bestDist) {
-						bestDist = d;
-						bestIdx = i;
-					}
-				});
-			}
-			const pick = known.splice(bestIdx, 1)[0];
-			pick.fromDist = cur ? manhattan(cur, pick.pos) : null;
-			out.push(pick);
-			cur = pick.pos;
-		}
-
-		return out.concat(unknown);
-	}
-
-	// -- daily cycle --------------------------------------------------------
-
-	dailyKey() {
-		return this.network.uuid || this.network.name;
-	}
-
-	restoreDaily() {
-		const saved = readDailyStore()[this.dailyKey()];
-		if (!saved || !saved.enabled) return false;
-		this.daily = {
-			enabled: true,
-			atMin: saved.atMin,
-			// Older saves stored a single shared limit.
-			budget: saved.budget || null,
-			accepted: Boolean(saved.accepted),
-			nodeOverrides: saved.nodeOverrides || null,
-			ignore: saved.ignore || null,
-			adapt: Boolean(saved.adapt),
-			recallThreshold: typeof saved.recallThreshold === "number" ? saved.recallThreshold : null,
-			survivalMargin: typeof saved.survivalMargin === "number" ? saved.survivalMargin : null,
-			specialty: saved.specialty || null,
-			specialtyCursor: saved.specialtyCursor || 0,
-			lastRunDay: saved.lastRunDay || null,
-			plan: saved.plan || (saved.limit
-				? Object.fromEntries(Object.keys(ACTIVITIES).map((a) => [a, saved.limit]))
-				: null),
-		};
-		this.finishers = saved.finishers || [];
-		this.armDaily();
-
-		// If it was left unaccepted, re-check and resume nagging.
-		if (!this.daily.accepted) {
-			(async () => {
-				try {
-					const est = await this.estimateDaily(this.lastPos || this.home());
-					const warns = this.dailyWarnings(est);
-					this.pendingWarnings = warns.length ? warns : null;
-					this.pendingSummary = warns.length ? this.dailySummarySentence(est) : null;
-					if (warns.length) this.armReminders();
-				} catch (err) {
-					// leave reminders off if the estimate cannot be built
-				}
-			})();
-		}
-
-		return true;
-	}
-
-	persistDaily() {
-		const store = readDailyStore();
-		if (this.daily.enabled) {
-			store[this.dailyKey()] = {
-				enabled: true,
-				atMin: this.daily.atMin,
-				plan: this.daily.plan,
-				budget: this.daily.budget || null,
-				accepted: Boolean(this.daily.accepted),
-				nodeOverrides: this.daily.nodeOverrides || null,
-				ignore: this.daily.ignore || null,
-				adapt: Boolean(this.daily.adapt),
-				recallThreshold: typeof this.daily.recallThreshold === "number" ? this.daily.recallThreshold : null,
-				survivalMargin: typeof this.daily.survivalMargin === "number" ? this.daily.survivalMargin : null,
-				specialty: this.daily.specialty || null,
-				specialtyCursor: this.daily.specialtyCursor || 0,
-				lastRunDay: this.daily.lastRunDay || null,
-				finishers: this.finishers,
-			};
-		} else {
-			delete store[this.dailyKey()];
-		}
-		writeDailyStore(store);
-	}
-
-	/**
-	 * Hardcore recovery defaults to on -- an explicit "hardcore off" is the
-	 * only way to disable it, so an entry missing from the store (never
-	 * configured) must read as on, not off.
-	 */
-	restoreHardcore() {
-		const saved = readHardcoreStore()[this.dailyKey()];
-		this.hardcore = typeof saved === "boolean" ? saved : true;
-		return this.hardcore;
-	}
-
-	persistHardcore() {
-		const store = readHardcoreStore();
-		store[this.dailyKey()] = this.hardcore;
-		writeHardcoreStore(store);
-	}
-
-	restoreGear() {
-		this.gear = readGearStore()[this.dailyKey()] || {};
-	}
-
-	persistGear() {
-		const store = readGearStore();
-		store[this.dailyKey()] = this.gear;
-		writeGearStore(store);
-	}
-
-	/** Saved item ids to !equip before an activity's runs, or null if none saved. */
-	gearFor(activity) {
-		const ids = this.gear[activity];
-		return ids && ids.length ? ids : null;
-	}
-
-	/**
-	 * Hardcore-mode recovery, run once per [DEATH]: reset home to a fixed town
-	 * (SeedHaven, away from whatever spot got us killed), recall there, then
-	 * re-equip. Does not resume the queue -- that still needs an explicit
-	 * "resume" so a death is never glossed over.
-	 */
-	hardcoreRecover() {
-		this.say(`Hardcore recovery: !home ${CONFIG.hardcoreHomeTown}, !recall, !equip best.`);
-		this.send(`!home ${CONFIG.hardcoreHomeTown}`);
-		setTimeout(() => this.send("!recall"), CONFIG.minGapMs);
-		setTimeout(() => this.send("!equip best"), CONFIG.minGapMs + CONFIG.recallMs);
-	}
-
-	/**
-	 * Next scheduled fire time. If today's slot was already run (including a
-	 * manual "daily now" sprung early), that slot is skipped so a still-armed
-	 * timer cannot fire the cycle a second time on the same UTC day.
-	 */
-	nextDailyAt() {
-		let next = nextUtcOccurrence(this.daily.atMin);
-		if (this.daily.lastRunDay && utcDay(next) === this.daily.lastRunDay) {
-			next = new Date(next.getTime() + 86400000);
-		}
-		return next;
-	}
-
-	/** Fraction of route travel that recalling home must save to be worth the item. */
-	recallThreshold() {
-		return typeof this.daily.recallThreshold === "number"
-			? this.daily.recallThreshold
-			: CONFIG.recallSavingsThreshold;
-	}
-
-	/** Levels above SUR a finishing node can run before it's treated as too dangerous to linger near. */
-	survivalMargin() {
-		return typeof this.daily.survivalMargin === "number"
-			? this.daily.survivalMargin
-			: CONFIG.survivalSafetyMargin;
-	}
-
-	/**
-	 * When specialty mode is on, replaces today's plan with just two stops:
-	 * the specialty activity gets `pct` of the day's gathering time (budget
-	 * minus travel estimated for these two specifically), the rest goes to
-	 * a second activity -- so every activity still gets covered eventually
-	 * without doing all of them daily.
-	 *
-	 * That second activity is chosen by trying, in order: (1) an open !daily
-	 * task on one of the other activities that awards FL tokens, since
-	 * gathering itself never grants FL (highest FL wins on a tie), then
-	 * (2) plain rotation starting from the cursor. Each candidate is tried
-	 * for real (its actual travel cost estimated) and the first one that
-	 * leaves at least minSpecialtySecondaryMs of gathering time is used --
-	 * otherwise whichever candidate came closest is used anyway, with a
-	 * warning, since a same-day pick can turn out to be much farther away
-	 * than the one it replaced. The rotation cursor advances past whichever
-	 * activity actually gets used, same as if it had won its turn fairly.
-	 *
-	 * Returns false (and leaves the plan untouched) if there's no budget to
-	 * split, since a specialty split has nothing to work from otherwise.
-	 */
-	async buildSpecialtyPlan() {
-		const {activity, pct} = this.daily.specialty;
-
-		if (!this.daily.budget) {
-			this.say(`Specialty mode needs a time budget -- set one with ${CMD} daily 10h.`);
-			return false;
-		}
-
-		const others = Object.keys(ACTIVITIES).filter((a) => a !== activity);
-		const startIdx = (this.daily.specialtyCursor || 0) % others.length;
-		const rotationOrder = others.map((_, i) => others[(startIdx + i) % others.length]);
-
-		let flPick = null;
-		try {
-			const lines = await this.ask("!daily", null, CONFIG.invCollectMs);
-			const byAct = new Map();   // activity -> highest FL reward seen for it
-
-			for (const line of lines) {
-				const tasks = parseDailyTasks(line);
-				if (!tasks) continue;
-
-				for (const t of tasks) {
-					if (t.complete || !t.fl) continue;
-					const act = matchActivity(t.desc);
-					if (!act || !others.includes(act)) continue;
-					if (!byAct.has(act) || t.fl > byAct.get(act)) byAct.set(act, t.fl);
-				}
-			}
-
-			if (byAct.size) {
-				const maxFl = Math.max(...byAct.values());
-				const tied = [...byAct.entries()].filter(([, fl]) => fl === maxFl).map(([act]) => act);
-
-				if (tied.length === 1) {
-					flPick = {act: tied[0], fl: maxFl};
-				} else {
-					// Equal FL reward on more than one activity -- break the tie
-					// by actual estimated travel TIME from where the day is
-					// starting, not raw tile distance, since learned per-node
-					// speed varies a lot (roads run 1-5 tiles/step, off-road
-					// always 1) -- the closer-looking node in tiles is not
-					// always the faster one to reach.
-					let bestAct = tied[0], bestMs = Infinity;
-					for (const act of tied) {
-						const node = await this.pickNode(act, {quiet: true});
-						const pos = node ? this.nodePos(act, node.name) : null;
-						const ms = pos && this.lastPos
-							? travelEstimate(manhattan(this.lastPos, pos), this.nodeSpeed(act, node.name)).ms
-							: Infinity;
-						if (ms < bestMs) {
-							bestMs = ms;
-							bestAct = act;
-						}
-					}
-					flPick = {act: bestAct, fl: maxFl};
-				}
-			}
-		} catch (err) {
-			// Fall back to plain rotation if !daily couldn't be read.
-		}
-
-		const tryOrder = flPick
-			? [flPick.act, ...rotationOrder.filter((a) => a !== flPick.act)]
-			: rotationOrder;
-
-		// Try each candidate for real until one clears the minimum, keeping
-		// whichever scored best in case none do.
-		let chosen = null;
-		let best = null;
-
-		for (const cand of tryOrder) {
-			this.daily.plan = {[activity]: {kind: "share"}, [cand]: {kind: "share"}};
-
-			let est = null;
-			try {
-				est = await this.estimateDaily(this.lastPos || this.home());
-			} catch (err) {
-				est = null;
-			}
-
-			const travel = est ? est.estTravel : 0;
-			const spare = Math.max(this.daily.budget - travel, 0);
-			const result = {
-				act: cand,
-				travel,
-				specialtyMs: Math.max(Math.floor(spare * pct), CONFIG.minShareMs),
-				secondaryMs: Math.max(Math.floor(spare * (1 - pct)), CONFIG.minShareMs),
-			};
-
-			if (!best || result.secondaryMs > best.secondaryMs) best = result;
-			if (result.secondaryMs >= CONFIG.minSpecialtySecondaryMs) {
-				chosen = result;
-				break;
-			}
-		}
-
-		const final = chosen || best;
-		const secondary = final.act;
-
-		if (flPick && flPick.act === secondary) {
-			this.say(`!daily task on ${secondary} awards +${flPick.fl} FL -- jumping it in today.`);
-		}
-		if (!chosen) {
-			this.say(
-				`Warning: even the best option (${secondary}) only leaves ${fmt(final.secondaryMs)} ` +
-				`after ~${fmt(final.travel)} travel -- consider a lower ${CMD} daily specialize ` +
-				`percent, a bigger ${CMD} daily budget, or fewer stops overall.`
-			);
-		} else if (secondary !== tryOrder[0]) {
-			this.say(`Skipped ${tryOrder[0]} today -- not enough time after travel; using ${secondary} instead.`);
-		}
-
-		this.daily.specialtyCursor = others.indexOf(secondary) + 1;
-		this.persistDaily();
-
-		this.daily.plan = {
-			[activity]: {kind: "time", value: final.specialtyMs},
-			[secondary]: {kind: "time", value: final.secondaryMs},
-		};
-
-		this.say(
-			`Specialty today: ${activity} ${fmt(final.specialtyMs)} (${Math.round(pct * 100)}%) + ` +
-			`${secondary} ${fmt(final.secondaryMs)} (${Math.round((1 - pct) * 100)}%) -- ~${fmt(final.travel)} travel.`
-		);
-		return true;
-	}
-
-	clearReminders() {
-		if (this.reminderTimer) {
-			clearTimeout(this.reminderTimer);
-			this.reminderTimer = null;
-		}
-	}
-
-	/**
-	 * Nags every 30 minutes between 00:00 UTC and the cycle's start time while
-	 * a warned-about schedule is still unaccepted. Silent once accepted, or
-	 * outside that window.
-	 */
-	armReminders() {
-		this.clearReminders();
-
-		if (!this.daily.enabled || this.daily.accepted || !this.pendingWarnings) return;
-
-		const now = new Date();
-		const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-		const startMs = midnight + this.daily.atMin * 60000;
-		const nowMs = now.getTime();
-
-		// Next slot: on the half hour from midnight, before the cycle starts.
-		let next;
-		if (nowMs < midnight) {
-			next = midnight;
-		} else if (nowMs < startMs) {
-			const since = nowMs - midnight;
-			next = midnight + (Math.floor(since / CONFIG.reminderEveryMs) + 1) * CONFIG.reminderEveryMs;
-			if (next >= startMs) next = null;
-		} else {
-			// Past today's start -- pick up at the next UTC midnight.
-			next = midnight + 86400000;
-		}
-
-		if (next === null) return;   // no slots left before the cycle runs
-
-		this.reminderTimer = setTimeout(() => {
-			this.reminderTimer = null;
-			if (!this.daily.enabled || this.daily.accepted || !this.pendingWarnings) return;
-
-			const start = nextUtcOccurrence(this.daily.atMin);
-			const left = start.getTime() - Date.now();
-
-			this.say(this.pendingSummary || this.pendingWarnings.join("; "));
-			this.say(
-				`Daily cycle starts in ${fmt(left)} and will NOT run unless accepted -- ` +
-				`${CMD} daily accept, or change the plan.`
-			);
-
-			this.armReminders();
-		}, Math.max(next - nowMs, 1000));
-	}
-
-	armDaily() {
-		if (this.dailyTimer) {
-			clearTimeout(this.dailyTimer);
-			this.dailyTimer = null;
-		}
-		if (!this.daily.enabled) return;
-
-		const when = this.nextDailyAt();
-		const delay = Math.max(when.getTime() - Date.now(), 1000);
-		this.dailyTimer = setTimeout(() => {
-			this.dailyTimer = null;
-			this.fireDaily();
-		}, delay);
-	}
-
-	/** Queue every gathering activity once, each with the shared limit (or, in specialty mode, just today's two). */
-	fireDaily() {
-		if (!this.daily.enabled) return;
-
-		if (this.current || this.queue.length) {
-			this.say(`Daily cycle skipped -- previous work still in progress (${this.queue.length} queued).`);
-			this.armDaily();
-			return;
-		}
-
-		if (!this.attached && !this.attach()) {
-			this.armDaily();
-			return;
-		}
-
-		this.daily.lastRunDay = utcDay();
-		this.persistDaily();
-
-		this.rotation = null;   // daily is a one-shot pass, not a loop
-		this.dailyRunActive = true;
-		this.dailyStartedAt = Date.now();
-		this.armDaily();        // schedule the next slot before the work begins
-
-		// Recall home first so the route plans from a known origin -- but
-		// only if a teleport is actually held. Without one, !recall does
-		// nothing and planning from "home" would be planning from somewhere
-		// we are not. Specialty mode's plan is built after this resolves
-		// (see planDailyOrSpecialty), so its travel estimate is based on
-		// wherever the day is actually starting from, not stale state left
-		// over from the last thing that happened.
-		this.startDailyFromKnownPosition();
-	}
-
-	/**
-	 * Builds the specialty plan (if any) using the now-settled starting
-	 * position, then hands off to planDaily. Must only be called once
-	 * startDailyFromKnownPosition has resolved whether today starts from
-	 * home or from the last known position -- calling it any earlier would
-	 * estimate specialty's travel split from stale state.
-	 */
-	async planDailyOrSpecialty() {
-		if (this.daily.specialty) {
-			const ok = await this.buildSpecialtyPlan();
-			if (!ok) {
-				this.dailyRunActive = false;
-				return;
-			}
-		}
-		await this.planDaily();
-	}
-
-	/**
-	 * Establishes where the cycle starts, then plans the route.
-	 *
-	 * With a recall consumable: teleport home and read the town coordinates.
-	 * Without one: fall back to the last position we observed, and route from
-	 * there rather than pretending to be at home.
-	 */
-	async startDailyFromKnownPosition() {
-		let stock = null;
-		try {
-			stock = await this.recallStock();
-		} catch (err) {
-			stock = null;
-		}
-
-		if (stock === 0) {
-			// No teleport. Ask where we actually are rather than trusting a
-			// remembered position, which may be badly stale.
-			let st = null;
-			try {
-				st = await this.fetchPosition();
-			} catch (err) {
-				st = null;
-			}
-
-			if (st && st.coords) {
-				this.say(`No ${CONFIG.recallItem} -- routing from current position ` +
-					`${st.coords[0]},${st.coords[1]}` +
-					(st.activity ? ` (currently ${st.activity})` : "") + ".");
-			} else if (this.lastPos) {
-				this.say(`No ${CONFIG.recallItem}, could not read !stats -- ` +
-					`routing from last known ${this.lastPos[0]},${this.lastPos[1]}.`);
-			} else {
-				this.say(`No ${CONFIG.recallItem} and no known position -- ` +
-					`stops will run in declared order.`);
-			}
-
-			await this.planDailyOrSpecialty();
-			return;
-		}
-
-		// We hold a teleport (or can't confirm either way). Recalling spends
-		// the consumable, so only do it when the route from home is enough
-		// shorter than the route from where we already are; otherwise route
-		// from here and keep the item.
-		let current = null;
-		try {
-			current = await this.fetchPosition();
-		} catch (err) {
-			current = null;
-		}
-		const from = (current && current.coords) || this.lastPos;
-
-		if (from) {
-			let estCurrent = null, estHome = null;
-			try {
-				estCurrent = await this.estimateDaily(from);
-				estHome = await this.estimateDaily(this.home());
-			} catch (err) {
-				estCurrent = estHome = null;
-			}
-
-			if (estCurrent && estHome && estCurrent.estTravel > 0) {
-				const savings = (estCurrent.estTravel - estHome.estTravel) / estCurrent.estTravel;
-				const threshold = this.recallThreshold();
-
-				if (savings < threshold) {
-					const desc = savings < 0
-						? `would increase travel by ${Math.round(-savings * 100)}%`
-						: `cuts travel by only ${Math.round(savings * 100)}% (< ${Math.round(threshold * 100)}% threshold)`;
-					this.say(
-						`Recall ${desc} -- ` +
-						`routing from current position ${from[0]},${from[1]} instead.`
-					);
-					await this.planDailyOrSpecialty();
-					return;
-				}
-
-				this.say(
-					`Recall cuts travel by ${Math.round(savings * 100)}% ` +
-					`(>= ${Math.round(threshold * 100)}% threshold) -- recalling home.`
-				);
-			}
-		}
-
-		if (stock === null) {
-			// Could not read the listing at all. Try the recall anyway; it is
-			// harmless if it fails, and the alternative is a worse route.
-			this.say("Could not read consumables -- attempting recall anyway.");
-		} else {
-			this.say(`Recalling home (${stock} ${CONFIG.recallItem}${stock === 1 ? "" : "s"} held).`);
-		}
-
-		this.send("!recall");
-
-		setTimeout(async () => {
-			// Ask the game where home actually is -- this keeps working as new
-			// towns are discovered and home moves.
-			let home = null;
-			try {
-				home = await this.fetchHome();
-			} catch (err) {
-				home = null;
-			}
-
-			if (home) {
-				this.lastPos = home.coords;
-				this.say(`Home: ${home.town} (${home.coords[0]},${home.coords[1]})`);
-			} else if (this.lastPos) {
-				this.say(`Could not read !home -- routing from ${this.lastPos[0]},${this.lastPos[1]}.`);
-			} else {
-				this.lastPos = this.home();
-				this.say(`Could not read !home -- using stored ${this.lastPos[0]},${this.lastPos[1]}.`);
-			}
-
-			await this.planDailyOrSpecialty();
-		}, CONFIG.recallMs);
-	}
-
-	/**
-	 * Resolves which node each activity will use, then orders the stops by
-	 * proximity so the cycle walks a short route instead of a fixed one.
-	 * Falls back to the declared order for nodes we have not mapped yet.
-	 */
-	/**
-	 * Every node for this activity that our level allows AND whose position we
-	 * know, best level first. These are the candidates a route can trade
-	 * between when the highest-level pick is too far away.
-	 */
-	async candidates(activity) {
-		const level = await this.getLevel(activity);
-		const nodes = await this.getNodes(activity);
-		if (!nodes.length) return [];
-
-		const eligible = (level === null ? nodes : nodes.filter((n) => n.level <= level))
-			.map((n) => Object.assign({}, n, {pos: this.nodePos(activity, n.name)}))
-			.filter((n) => n.pos);
-
-		return eligible.sort((a, b) => b.level - a.level);
-	}
-
-	/** Total travel for a given choice of node per activity, greedily routed. */
-	routeCost(choice, from) {
-		const stops = Object.entries(choice).map(([act, node]) => ({act, node, pos: node.pos}));
-		const ordered = this.orderByProximity(stops, from);
-		let ms = 0;
-		for (const st of ordered) {
-			if (st.fromDist) ms += travelEstimate(st.fromDist, this.nodeSpeed(st.act, st.node.name)).ms;
-		}
-		return {ms, ordered};
-	}
-
-	/**
-	 * Finds the highest-level set of nodes whose route still leaves acceptable
-	 * gathering time. Starts from the best nodes and repeatedly downgrades
-	 * whichever one buys the most travel saving per level given up, stopping as
-	 * soon as the schedule clears its guards.
-	 */
-	async optimiseRoute(from) {
-		const plan = this.daily.plan || {};
-		const pool = {};
-
-		for (const act of Object.keys(plan)) {
-			const c = await this.candidates(act);
-			if (!c.length) continue;
-
-			// Break same-level ties by distance from `from` -- otherwise the
-			// starting pick (and any level this later downgrades to) can land
-			// on a node hours away over one standing right next to it.
-			pool[act] = from
-				? c.slice().sort((a, b) => b.level - a.level || manhattan(from, a.pos) - manhattan(from, b.pos))
-				: c;
-		}
-
-		if (!Object.keys(pool).length) return null;
-
-		// Start with the best node for each activity.
-		const choice = {};
-		const idx = {};
-		for (const [act, list] of Object.entries(pool)) {
-			choice[act] = list[0];
-			idx[act] = 0;
-		}
-
-		const evaluate = () => {
-			const {ms, ordered} = this.routeCost(choice, from);
-			const shared = ordered.filter((st) => plan[st.act].kind === "share");
-			const fixedMs = ordered
-				.filter((st) => plan[st.act].kind === "time")
-				.reduce((a, st) => a + plan[st.act].value, 0);
-
-			let per = null;
-			if (shared.length) {
-				per = Math.max(
-					Math.floor((this.daily.budget - ms - fixedMs) / shared.length),
-					0
-				);
-			}
-
-			const perStop = ordered.map((st) =>
-				plan[st.act].kind === "share" ? per : plan[st.act].value);
-			const gatherMs = perStop.reduce((a, v) => a + v, 0);
-			const minPerStop = perStop.length ? Math.min(...perStop) : 0;
-
-			return {
-				travelMs: ms, ordered, gatherMs, minPerStop, per,
-				ok: minPerStop >= CONFIG.minGatherPerStopMs && gatherMs >= ms,
-			};
-		};
-
-		let best = evaluate();
-		const steps = [];
-
-		// Hill-climb: each round, downgrade the single node that saves the most
-		// travel per level surrendered.
-		for (let guard = 0; guard < 40 && !best.ok; guard++) {
-			let pick = null;
-
-			for (const [act, list] of Object.entries(pool)) {
-				const next = idx[act] + 1;
-				if (next >= list.length) continue;
-
-				const was = choice[act];
-				choice[act] = list[next];
-				const trial = evaluate();
-				choice[act] = was;
-
-				const saved = best.travelMs - trial.travelMs;
-				const lost = Math.max(was.level - list[next].level, 1);
-				const value = saved / lost;
-
-				if (saved > 0 && (!pick || value > pick.value)) {
-					pick = {act, next, value, saved, lost, node: list[next], trial};
-				}
-			}
-
-			if (!pick) break;   // nothing left that helps
-
-			choice[pick.act] = pick.node;
-			idx[pick.act] = pick.next;
-			best = pick.trial;
-			steps.push(
-				`${pick.act}: ${pool[pick.act][pick.next - 1].name} (Lv${pool[pick.act][pick.next - 1].level}) ` +
-				`-> ${pick.node.name} (Lv${pick.node.level}), saves ${fmt(pick.saved)}`
-			);
-		}
-
-		return {choice, steps, result: best};
-	}
-
-	/**
-	 * Works out which stops will run, in what order, and what each costs.
-	 * Shared by the live cycle and the setup-time preview, so the warning you
-	 * get when scheduling reflects what will actually happen.
-	 */
-	async estimateDaily(from) {
-		const plan = this.daily.plan || {};
-		const overrides = this.daily.nodeOverrides || {};
-		const stops = [];
-
-		for (const act of Object.keys(plan)) {
-			let node = null;
-
-			// A node chosen by the optimiser wins over the highest-level pick.
-			if (overrides[act]) {
-				const list = await this.candidates(act);
-				node = list.find((n) => n.name.toLowerCase() === overrides[act].toLowerCase()) || null;
-			}
-
-			if (!node) {
-				try {
-					node = await this.pickNode(act, {quiet: true});
-				} catch (err) {
-					node = null;
-				}
-			}
-
-			if (!node) continue;
-			stops.push({act, node, pos: node.pos || this.nodePos(act, node.name)});
-		}
-
-		if (!stops.length) return null;
-
-		const unmapped = stops.filter((st) => !st.pos);
-		const mappedStops = stops.filter((st) => st.pos);
-		const planned = mappedStops.length ? mappedStops : stops;
-
-		const ordered = this.orderByProximity(planned, from);
-
-		let travelMs = 0;
-		let knownLegs = 0;
-		for (const st of ordered) {
-			if (st.fromDist) {
-				travelMs += travelEstimate(st.fromDist, this.nodeSpeed(st.act, st.node.name)).ms;
-				knownLegs++;
-			}
-		}
-
-		// Unmapped legs would otherwise look free; charge them the average.
-		const avgLeg = knownLegs ? travelMs / knownLegs : 0;
-		const estTravel = travelMs + (ordered.length - knownLegs) * avgLeg;
-
-		// Resolve budget shares.
-		const limits = {};
-		const shared = ordered.filter((st) => plan[st.act].kind === "share");
-		const fixedMs = ordered
-			.filter((st) => plan[st.act].kind === "time")
-			.reduce((a, st) => a + plan[st.act].value, 0);
-
-		let spare = null;
-		let per = null;
-
-		if (shared.length) {
-			spare = this.daily.budget - estTravel - fixedMs;
-			per = Math.max(Math.floor(spare / shared.length), CONFIG.minShareMs);
-			for (const st of shared) limits[st.act] = {kind: "time", value: per};
-		}
-
-		for (const st of ordered) {
-			if (!limits[st.act]) limits[st.act] = plan[st.act];
-		}
-
-		const gatherMs = ordered.reduce((a, st) => {
-			const l = limits[st.act];
-			return a + (l.kind === "time" ? l.value : 0);
-		}, 0);
-
-		const timed = ordered.filter((st) => limits[st.act].kind === "time");
-		const minPerStop = timed.length
-			? Math.min(...timed.map((st) => limits[st.act].value))
-			: null;
-
-		// Which stops fall under the gathering threshold, and by how much.
-		const short = timed.filter((st) => limits[st.act].value < CONFIG.minGatherPerStopMs);
-
-		return {
-			ordered, unmapped, limits, travelMs, estTravel, fixedMs,
-			gatherMs, spare, per, minPerStop, timed, short,
-			knownTravelMs: travelMs,
-			assumedTravelMs: Math.max(estTravel - travelMs, 0),
-			assumedLegs: ordered.length - knownLegs,
-			mapped: ordered.filter((st) => st.pos).length,
-		};
-	}
-
-	/**
-	 * The headline sentence: what travel costs, and what that leaves to
-	 * gather with. Names the assumed portion separately so an estimate built
-	 * on unmapped legs is not mistaken for a measurement.
-	 */
-	dailySummarySentence(est) {
-		if (!est) return null;
-
-		const travel = est.assumedTravelMs
-			? `${fmt(est.estTravel)} (${fmt(est.knownTravelMs)} known + ${fmt(est.assumedTravelMs)} assumed ` +
-				`across ${est.assumedLegs} unmapped leg${est.assumedLegs === 1 ? "" : "s"})`
-			: `${fmt(est.estTravel)}`;
-
-		if (!est.timed.length) {
-			return `Your travel time of ${travel} applies before any gathering starts.`;
-		}
-
-		const total = est.timed.length;
-		const short = est.short.length;
-
-		let gather;
-		if (!short) {
-			gather = `${fmt(est.minPerStop)} or more for each of ${total} activities`;
-		} else if (short === total) {
-			gather = `under ${fmt(CONFIG.minGatherPerStopMs)} for all ${total} activities ` +
-				`(as little as ${fmt(est.minPerStop)})`;
-		} else {
-			gather = `under ${fmt(CONFIG.minGatherPerStopMs)} for ${short} of ${total} activities ` +
-				`(${est.short.map((st) => st.act).join(", ")}; as little as ${fmt(est.minPerStop)})`;
-		}
-
-		return `Your travel time of ${travel} will result in gather time of ${gather}.`;
-	}
-
-	/**
-	 * Shown when no shorter route exists: what the best option actually is,
-	 * and the ways to proceed anyway.
-	 */
-	sayOptions(est) {
-		if (est) {
-			const acts = est.ordered.map((st) =>
-				`${st.act} @ ${st.node.name} (Lv${st.node.level})`).join(", ");
-			this.say(`Best available: ${acts}`);
-			this.say(
-				`  ~${fmt(est.estTravel)} travel, ${fmt(est.gatherMs)} gathering, ` +
-				`${fmt(est.minPerStop || 0)} at the shortest stop`
-			);
-		}
-
-		this.say("Options:");
-		if (this.daily.budget) {
-			this.say(`  ${CMD} daily ignore budget    keep the per-stop times, overrun the window`);
-		}
-		this.say(`  ${CMD} daily ignore travel    accept travel exceeding gather time`);
-		this.say(`  ${CMD} daily ignore minimum   accept stops under ${fmt(CONFIG.minGatherPerStopMs)}`);
-		if (this.daily.budget) {
-			this.say(`  ${CMD} daily adapt            re-divide the window as real travel is measured`);
-		}
-		this.say(`  ${CMD} daily accept            run it as-is`);
-	}
-
-	/** Reasons this schedule looks like a bad use of the window. */
-	dailyWarnings(est) {
-		const w = [];
-		if (!est) return w;
-
-		const ig = this.daily.ignore || {};
-
-		if (!ig.minimum && est.minPerStop !== null && est.minPerStop < CONFIG.minGatherPerStopMs) {
-			w.push(`only ${fmt(est.minPerStop)} gathering per stop ` +
-				`(under the ${fmt(CONFIG.minGatherPerStopMs)} threshold)`);
-		}
-
-		if (!ig.travel && est.gatherMs && est.estTravel > est.gatherMs) {
-			w.push(`travel ~${fmt(est.estTravel)} exceeds gathering ${fmt(est.gatherMs)}`);
-		}
-
-		if (!ig.budget && est.spare !== null && est.spare <= 0) {
-			w.push(`budget ${fmt(this.daily.budget)} is entirely consumed by travel`);
-		}
-
-		return w;
-	}
-
-	async planDaily() {
-		const stops = [];
-
-		const plan = this.daily.plan || {};
-
-		for (const act of Object.keys(plan)) {
-			let node = null;
-			try {
-				node = await this.pickNode(act, {quiet: true});
-			} catch (err) {
-				node = null;
-			}
-			if (!node) continue;
-			stops.push({act, node, pos: this.nodePos(act, node.name)});
-		}
-
-		if (!stops.length) {
-			this.say("Daily cycle: could not resolve any nodes -- skipping today.");
-			return;
-		}
-
-		// Drop stops whose node position is unknown. They cannot be routed, so
-		// they land at the end of the run and their travel cost is a guess --
-		// which throws off both the route and any wall-clock budget.
-		const unmapped = stops.filter((st) => !st.pos);
-		const mappedStops = stops.filter((st) => st.pos);
-
-		if (unmapped.length && mappedStops.length) {
-			this.say(
-				`Skipping unmapped: ${unmapped.map((st) => `${st.act} (${st.node.name})`).join(", ")}` +
-				` -- visit once with ${CMD} q <activity> to add ${unmapped.length === 1 ? "it" : "them"} to the map.`
-			);
-		}
-
-		// Nothing mapped at all: run everything, since this is the survey pass.
-		const planned = mappedStops.length ? mappedStops : stops;
-
-		const ordered = this.orderByProximity(planned, this.lastPos);
-
-		// Re-check the guards against the live route. If the schedule was
-		// confirmed at setup we proceed; otherwise skip rather than spend the
-		// night walking.
-		{
-			const est = await this.estimateDaily(this.lastPos);
-			const warns = this.dailyWarnings(est);
-			if (warns.length && !this.daily.accepted) {
-				this.say(this.dailySummarySentence(est) || warns.join("; "));
-				this.say(`Daily cycle skipped -- accept with ${CMD} daily accept, or change the plan.`);
-				this.pendingWarnings = warns;
-				this.pendingSummary = this.dailySummarySentence(est);
-				this.armReminders();
-				return;
-			}
-			this.pendingWarnings = null;
-			this.pendingSummary = null;
-			this.clearReminders();
-		}
-		let travelMs = 0;
-		for (const st of ordered) {
-			if (st.fromDist) travelMs += travelEstimate(st.fromDist, this.nodeSpeed(st.act, st.node.name)).ms;
-		}
-
-		const mapped = ordered.filter((s) => s.pos).length;
-
-		// Resolve any "share of budget" limits now that travel is estimated.
-		const resolved = {};
-		const shared = ordered.filter((st) => plan[st.act].kind === "share");
-
-		if (shared.length) {
-			// Unmapped stops contribute no estimate, so assume they cost about
-			// the average of the ones we do know -- otherwise the budget would
-			// be handed out as if they were free.
-			const knownLegs = ordered.filter((st) => st.fromDist).length;
-			const avgLeg = knownLegs ? travelMs / knownLegs : 0;
-			const unknownLegs = ordered.length - knownLegs;
-			const estTravel = travelMs + unknownLegs * avgLeg;
-
-			const fixedMs = ordered
-				.filter((st) => plan[st.act].kind === "time")
-				.reduce((a, st) => a + plan[st.act].value, 0);
-
-			const spare = this.daily.budget - estTravel - fixedMs;
-			const each = Math.floor(spare / shared.length);
-
-			if (each < CONFIG.minShareMs) {
-				this.say(
-					`Budget ${fmt(this.daily.budget)} leaves only ${fmt(Math.max(spare, 0))} ` +
-					`for ${shared.length} stops after ~${fmt(estTravel)} travel` +
-					(fixedMs ? ` and ${fmt(fixedMs)} fixed` : "") + ".");
-				if (spare <= 0) {
-					this.say("Nothing left to gather with -- skipping today.");
-					return;
-				}
-				this.say(`Using the ${fmt(CONFIG.minShareMs)} minimum per stop instead.`);
-			}
-
-			const per = Math.max(each, CONFIG.minShareMs);
-			for (const st of shared) resolved[st.act] = {kind: "time", value: per};
-
-			this.say(
-				`Budget ${fmt(this.daily.budget)} -- ~${fmt(estTravel)} travel` +
-				(unknownLegs ? ` (${unknownLegs} leg${unknownLegs === 1 ? "" : "s"} estimated)` : "") +
-				(fixedMs ? `, ${fmt(fixedMs)} fixed` : "") +
-				` -> ${fmt(per)} each`
-			);
-		}
-
-		const limitFor = (act) => resolved[act] || plan[act];
-		const limitMs = ordered.reduce((a, st) => {
-			const l = limitFor(st.act);
-			return a + (l.kind === "time" ? l.value : 0);
-		}, 0);
-
-		this.queue = ordered.map((st) => {
-			const run = new Run(st.act, st.node.id || st.node.name, Object.assign({}, limitFor(st.act)));
-			run.resolved = st.node;
-			return run;
-		});
-
-		this.say(
-			`Daily cycle: ${ordered.length} stops -- ` +
-			ordered.map((st) => `${st.act} ${describeLimit(limitFor(st.act))}`).join(" -> ")
-		);
-		this.say(
-			`Route: ${mapped}/${ordered.length} nodes mapped` +
-			(travelMs ? `, est. ${fmt(travelMs)} travel` : "") +
-			(limitMs ? `, ${fmt(limitMs + travelMs)} total` : "")
-		);
-
-		this.advance();
-	}
-
-	dailyStatus() {
-		if (!this.daily.enabled) {
-			return `Daily cycle off. Set with ${CMD} daily 10h [at 02:00]`;
-		}
-		const when = this.nextDailyAt();
-		const inMs = when.getTime() - Date.now();
-		const plan = this.daily.plan || {};
-		const what = this.daily.specialty
-			? `specializing in ${this.daily.specialty.activity} (${Math.round(this.daily.specialty.pct * 100)}%) ` +
-			  `within ${fmt(this.daily.budget)} (travel included)`
-			: this.daily.budget
-			? `${Object.keys(plan).length} activities within ${fmt(this.daily.budget)} (travel included)`
-			: describePlan(plan);
-		return `Daily cycle on -- ${what}, at ${fmtUtc(this.daily.atMin)} ` +
-			`(next ${when.toISOString().slice(0, 16).replace("T", " ")} UTC, in ${fmt(inMs)})` +
-			(this.daily.adapt ? " | adaptive" : "") +
-			` | recall >= ${Math.round(this.recallThreshold() * 100)}% saved` +
-			` | safety SUR +${this.survivalMargin()}` +
-			(this.daily.ignore && Object.keys(this.daily.ignore).length
-				? ` | ignoring: ${Object.keys(this.daily.ignore).join(", ")}`
-				: "") +
-			(this.finishers.length
-				? ` | then: ${this.finishers.map(describeFinisher).join(", ")}`
-				: "");
-	}
-
-	// -- asking DM questions ------------------------------------------------
-
-	/** Send `text`, then buffer every DM line for collectMs and return them. */
-	ask(text, until, ms) {
-		if (this.collector) this.collector.finish();
-		this.send(text);
-
-		return new Promise((resolve) => {
-			const c = {
-				lines: [],
-				timer: null,
-				until: until || null,
-				finish: () => {
-					if (c.timer) clearTimeout(c.timer);
-					if (this.collector === c) this.collector = null;
-					resolve(c.lines);
-				},
-			};
-			c.timer = setTimeout(c.finish, ms || CONFIG.collectMs);
-			this.collector = c;
-		});
-	}
-
-	async getLevel(activity) {
-		const stat = ACTIVITIES[activity].stat;
-		const hit = this.levels.get(stat);
-		if (hit && Date.now() - hit.at < CONFIG.cacheMs) return hit.level;
-
-		const lines = await this.ask(CONFIG.levelCommand, (l) => parseStats(l) !== null);
-		const at = Date.now();
-
-		for (const l of lines) {
-			const stats = parseStats(l);
-			if (!stats) continue;
-			for (const [k, v] of Object.entries(stats)) this.levels.set(k, {level: v, at});
-		}
-
-		const got = this.levels.get(stat);
-		return got ? got.level : null;
-	}
-
-	async getNodes(activity) {
-		const hit = this.nodeCache.get(activity);
-		if (hit && Date.now() - hit.at < CONFIG.cacheMs) return hit.nodes;
-
-		const lines = await this.ask(
-			`!${activity} ${ACTIVITIES[activity].noun}`,
-			(l) => parseNodeList(l).length > 0
-		);
-		const nodes = lines.reduce((acc, l) => acc.concat(parseNodeList(l)), []);
-		if (nodes.length) this.nodeCache.set(activity, {nodes, at: Date.now()});
-		return nodes;
-	}
-
-	/**
-	 * Highest-level node at or below our skill level. Among several tied at
-	 * that top level, prefers whichever is closest to `from` (default: last
-	 * known position) -- otherwise ties break on list order alone, which can
-	 * send us hours away from a same-level node standing right next to us.
-	 */
-	async pickNode(activity, opts) {
-		const quiet = opts && opts.quiet;
-		const from = (opts && opts.from) || this.lastPos;
-		const level = await this.getLevel(activity);
-		const nodes = await this.getNodes(activity);
-
-		if (!nodes.length) {
-			if (!quiet) this.say(`Could not read a ${ACTIVITIES[activity].noun} list for !${activity}.`);
-			return null;
-		}
-
-		const sorted = nodes.slice().sort((a, b) => b.level - a.level);
-
-		if (level === null) {
-			if (!quiet) this.say(`Could not read your ${ACTIVITIES[activity].skill} level -- using lowest node.`);
-			return sorted[sorted.length - 1];
-		}
-
-		const eligible = sorted.filter((n) => n.level <= level);
-		if (!eligible.length) {
-			const lowest = sorted[sorted.length - 1];
-			if (!quiet) this.say(`${ACTIVITIES[activity].skill} ${level} is below every node (min ${lowest.level}) -- trying ${lowest.name}.`);
-			return lowest;
-		}
-
-		const tied = eligible.filter((n) => n.level === eligible[0].level);
-		let best = tied[0];
-		if (tied.length > 1 && from) {
-			let bestDist = Infinity;
-			for (const n of tied) {
-				const pos = this.nodePos(activity, n.name);
-				if (!pos) continue;
-				const d = manhattan(from, pos);
-				if (d < bestDist) {
-					bestDist = d;
-					best = n;
-				}
-			}
-		}
-
-		const next = sorted.filter((n) => n.level > level).pop();
-		if (!quiet) {
-			this.say(
-				`${ACTIVITIES[activity].skill} ${level} -> ${best.name} (lv ${best.level})` +
-				(next ? `, next unlock ${next.name} at ${next.level}` : "")
-			);
-		}
-		return best;
-	}
-
-	// -- scheduling --------------------------------------------------------
-
-	clearTimer() {
-		if (this.timer) {
-			clearTimeout(this.timer);
-			this.timer = null;
-		}
-		if (this.confirmTimer) {
-			clearTimeout(this.confirmTimer);
-			this.confirmTimer = null;
-		}
-	}
-
-	/**
-	 * Only time-limited runs need a wall clock. Count and xp limits resolve on
-	 * inbound ticks, so they arm nothing -- there is no stall detection
-	 * anywhere: a quiet run is assumed to still be running, and only the user
-	 * ends it (/unkgather skip or stop).
-	 */
-	armTimer() {
-		this.clearTimer();
-		const run = this.current;
-		if (!run) return;
-
-		const remaining = run.msRemaining();
-		if (remaining === null) return;   // count/xp limit -- nothing to time
-
-		this.timer = setTimeout(() => {
-			this.timer = null;
-			if (run.isDone()) this.finishRun();
-			else this.armTimer();
-		}, Math.max(Math.min(remaining, CONFIG.maxWaitMs), 1000));
-	}
-
-	// -- run lifecycle -----------------------------------------------------
-
-	/**
-	 * With `adapt` on, re-divides the remaining window across the stops still
-	 * to come, using travel actually measured so far instead of the estimate.
-	 * Runs before each stop, so an unexpectedly long walk shortens what
-	 * follows rather than overrunning the window.
-	 */
-	adaptRemaining() {
-		if (!this.dailyRunActive || !this.daily.adapt || !this.daily.budget) return;
-		if (!this.dailyStartedAt || !this.queue.length) return;
-
-		const elapsed = Date.now() - this.dailyStartedAt;
-		const remainingBudget = this.daily.budget - elapsed;
-
-		// Estimate the travel still ahead from the map.
-		let cur = this.lastPos;
-		let travelAhead = 0;
-		for (const run of this.queue) {
-			const nodeName = run.confirmedNode || run.node;
-			const pos = this.nodePos(run.activity, nodeName);
-			if (cur && pos) {
-				travelAhead += travelEstimate(manhattan(cur, pos), this.nodeSpeed(run.activity, nodeName)).ms;
-			}
-			if (pos) cur = pos;
-		}
-
-		const spare = remainingBudget - travelAhead;
-		const per = Math.floor(spare / this.queue.length);
-
-		if (per < CONFIG.minShareMs) {
-			this.say(
-				`Window nearly spent (${fmt(Math.max(remainingBudget, 0))} left, ` +
-				`~${fmt(travelAhead)} of it travel) -- dropping the last ` +
-				`${this.queue.length} stop${this.queue.length === 1 ? "" : "s"}.`
-			);
-			this.queue = [];
-			return;
-		}
-
-		const before = this.queue[0].limit.value;
-		if (Math.abs(per - before) < 60000) return;   // not worth announcing
-
-		for (const run of this.queue) run.limit = {kind: "time", value: per};
-		this.say(
-			`Adapting: ${fmt(remainingBudget)} left for ${this.queue.length} stops ` +
-			`(~${fmt(travelAhead)} travel) -> ${fmt(per)} each` +
-			(per < before ? ` (was ${fmt(before)})` : ` (up from ${fmt(before)})`)
-		);
-	}
-
-	/**
-	 * Before starting the next queued stop, checks whether switching home to
-	 * a different known town and recalling there would reach it faster than
-	 * walking from here -- not just the current home, since whichever town
-	 * is quickest can change stop to stop. Switching home has no cost of its
-	 * own, so this is purely a travel-time comparison, gated by the same
-	 * savings threshold as the start-of-day recall decision.
-	 */
-	async maybeRecallForNextStop(next) {
-		const dbg = (msg) => { if (this.debug) this.say(`[recall-check] ${msg}`); };
-
-		if (!next || !next.node || next.node === AUTO || next.activity === "grind") {
-			dbg(`skip -- ${!next ? "no next run" : next.activity === "grind" ? "grind has no node" : "node not yet resolved (auto)"}`);
-			return;
-		}
-		if (!this.lastPos) {
-			dbg("skip -- current position unknown");
-			return;
-		}
-
-		// Daily-plan stops queue the node's ID (what the game command actually
-		// takes -- see planDaily), but positions are keyed by name, so the
-		// resolved node object (set alongside .node there) is the one to use
-		// when present; a manually-queued run's .node is already the name.
-		const nodeName = next.resolved ? next.resolved.name : next.node;
-		const nextPos = this.nodePos(next.activity, nodeName);
-		if (!nextPos) {
-			dbg(`skip -- ${next.activity} ${nodeName} has no known position`);
-			return;
-		}
-
-		let stock = null;
-		try {
-			stock = await this.recallStock();
-		} catch (err) {
-			stock = null;
-		}
-		if (!stock) {
-			dbg(`skip -- no ${CONFIG.recallItem} held (${stock === null ? "unknown" : "0"})`);
-			return;
-		}
-
-		const speed = this.nodeSpeed(next.activity, nodeName);
-		const directMs = travelEstimate(manhattan(this.lastPos, nextPos), speed).ms;
-		if (directMs <= 0) {
-			dbg(`skip -- already at ${next.activity} ${nodeName}`);
-			return;
-		}
-
-		let best = null;
-		for (const [town, coords] of Object.entries(this.knownTowns())) {
-			const ms = travelEstimate(manhattan(coords, nextPos), speed).ms;
-			if (!best || ms < best.ms) best = {town, coords, ms};
-		}
-		if (!best) {
-			dbg("skip -- no known towns to recall to yet");
-			return;
-		}
-
-		const savings = (directMs - best.ms) / directMs;
-		dbg(
-			`${next.activity} ${nodeName}: direct ${fmt(directMs)} vs ${best.town} ${fmt(best.ms)} ` +
-			`(${Math.round(savings * 100)}% saved, need ${Math.round(this.recallThreshold() * 100)}%)` +
-			(savings < this.recallThreshold() ? " -- staying put" : " -- recalling")
-		);
-		if (savings < this.recallThreshold()) return;
-
-		this.say(
-			`Recall to ${best.town} cuts travel to the next stop by ${Math.round(savings * 100)}% ` +
-			`(>= ${Math.round(this.recallThreshold() * 100)}% threshold) -- switching home and recalling.`
-		);
-
-		const switching = best.town !== this.homeTown();
-		if (switching) {
-			// Remember the town this detour is leaving, not whatever an
-			// earlier detour left home as -- otherwise a second detour before
-			// the first restores would "restore" to the wrong place.
-			if (this.homeRestoreOriginal === null) this.homeRestoreOriginal = this.homeTown();
-			this.send(`!home ${best.town}`);
-			await sleep(CONFIG.minGapMs);
-		}
-		this.send("!recall");
-		await sleep(CONFIG.recallMs);
-		this.lastPos = best.coords;
-
-		if (switching && this.homeRestoreOriginal) {
-			if (this.homeRestoreTimer) clearTimeout(this.homeRestoreTimer);
-			const original = this.homeRestoreOriginal;
-			this.homeRestoreTimer = setTimeout(() => {
-				this.homeRestoreTimer = null;
-				this.homeRestoreOriginal = null;
-				this.send(`!home ${original}`);
-				this.say(`Restored home to ${original} after the detour.`);
-			}, CONFIG.homeRestoreDelayMs);
-		}
-	}
-
-	advance() {
-		if (this.halted) return;
-		this.adaptRemaining();
-
-		if (!this.queue.length && this.rotation) {
-			this.queue = this.rotation.map(cloneRun);
-		}
-
-		if (!this.queue.length) {
-			this.current = null;
-			this.say("Queue empty.");
-			this.runFinishers();
-			return;
-		}
-
-		const next = this.queue.shift();
-		(async () => {
-			await this.maybeRecallForNextStop(next);
-			this.startRun(next);
-		})();
-	}
-
-	async startRun(run) {
-		if (this.starting) return;
-		this.starting = true;
-
-		try {
-			// Grind has no node, no start command, and no confirmation line of
-			// its own -- see parseLine's TRAVEL handling and the p.travel/p.move
-			// branches in onLine for how "arrival" and the timer actually work.
-			if (run.activity === "grind") {
-				if (this.halted) return;
-
-				this.current = run;
-				run.reset();
-				run.state = "pending";
-
-				const [gx, gy] = run.targetPos;
-				const sendStart = () => {
-					this.send(`!waypoint ${gx} ${gy}`);
-					this.say(`Sent !waypoint ${gx} ${gy} -- awaiting travel confirmation`);
-
-					this.confirmTimer = setTimeout(() => {
-						this.confirmTimer = null;
-						if (this.current === run && run.state === "pending") {
-							this.say(`No waypoint confirmation after ${fmt(CONFIG.confirmMs)} -- skipping.`);
-							this.current = null;
-							this.advance();
-						}
-					}, CONFIG.confirmMs);
-				};
-
-				// Grind is pure combat, so unlike the gathering activities it
-				// still equips something even with no saved loadout.
-				const gear = this.gearFor(run.activity);
-				if (gear) {
-					this.send(`!equip ${gear.join(" ")}`);
-					this.say(`Equipping grind loadout (${gear.length} items).`);
-				} else {
-					this.send("!equip best");
-					this.say("No grind loadout saved -- equipping best gear.");
-				}
-				setTimeout(sendStart, CONFIG.minGapMs);
-				return;
-			}
-
-			let node = run.node;
-
-			if (node === AUTO || (!node && CONFIG.autoNode)) {
-				const picked = await this.pickNode(run.activity);
-				node = picked ? (picked.id || picked.name) : null;
-				run.resolved = picked;
-			}
-
-			if (this.halted) return;
-
-			// A bare "!fish" is a STATUS QUERY, not a start. Sending it when
-			// node resolution failed looks like a start that never confirms,
-			// then burns the confirmation timeout. Fail immediately instead.
-			if (!node) {
-				this.say(
-					`No node resolved for !${run.activity} -- not starting. ` +
-					`Try ${CMD} nodes ${run.activity}, or queue an explicit node.`
-				);
-				this.current = null;
-				setTimeout(() => this.advance(), CONFIG.minGapMs);
-				return;
-			}
-
-			this.current = run;
-			run.reset();
-			run.state = "pending";
-			run.requestedNode = node;
-
-			const startCmd = node ? `!${run.activity} ${node}` : `!${run.activity}`;
-			const sendStart = () => {
-				this.send(startCmd);
-				this.say(`Sent ${startCmd}` +
-					(run.resolved ? ` (${run.resolved.name}, Lv${run.resolved.level}+)` : "") +
-					` -- awaiting confirmation`);
-
-				// The clock starts only when DM confirms. Until then, nothing counts.
-				this.confirmTimer = setTimeout(() => {
-					this.confirmTimer = null;
-					if (this.current === run && run.state === "pending") {
-						this.say(`No start confirmation for !${run.activity} after ${fmt(CONFIG.confirmMs)} -- skipping.`);
-						this.current = null;
-						this.advance();
-					}
-				}, CONFIG.confirmMs);
-			};
-
-			// A saved loadout (see "<activity> gear") is equipped first, since
-			// combat gear can matter as much as the tool for what mobs a node
-			// throws at us.
-			const gear = this.gearFor(run.activity);
-			if (gear) {
-				this.send(`!equip ${gear.join(" ")}`);
-				this.say(`Equipping ${run.activity} loadout (${gear.length} items).`);
-				setTimeout(sendStart, CONFIG.minGapMs);
-			} else {
-				sendStart();
-			}
-		} finally {
-			this.starting = false;
-		}
-	}
-
-	/** Grind has no real stop command either -- clearing the waypoint ends the farm-anchor. */
-	stopCommandFor(run) {
-		return run.activity === "grind" ? "!waypoint clear" : `!${run.activity} stop`;
-	}
-
-	finishRun() {
-		const run = this.current;
-		if (!run) return;
-
-		this.clearTimer();
-		this.send(this.stopCommandFor(run));
-		this.say(run.summary());
-		this.recordRun(run);
-
-		if (run.resolved && typeof run.resolved.level === "number") {
-			this.lastNodeLevel = run.resolved.level;
-		}
-
-		this.totals.runs++;
-		this.totals.successes += run.successes;
-		this.totals.xp += run.xp;
-		for (const [name, n] of run.loot) {
-			this.totals.loot.set(name, (this.totals.loot.get(name) || 0) + n);
-		}
-
-		this.current = null;
-		setTimeout(() => this.advance(), CONFIG.minGapMs);
-	}
-
-	stopCurrent(reason) {
-		const run = this.current;
-		this.clearTimer();
-		if (run) {
-			this.send(this.stopCommandFor(run));
-			this.say(`${run.summary()} (${reason})`);
-			// Work done before an early stop still counts.
-			if (run.state === "running" && run.ticks) this.recordRun(run);
-			this.current = null;
-		}
-	}
-
-	// -- outbound ----------------------------------------------------------
-
-	send(text) {
-		const irc = this.network.irc;
-		if (!irc) return;
-		const gap = CONFIG.minGapMs - (Date.now() - this.lastSend);
-		const fire = () => {
-			irc.say(CONFIG.botNick, text);
-			this.lastSend = Date.now();
-		};
-		if (gap > 0) setTimeout(fire, gap); else fire();
-	}
-}
-
-// ---------------------------------------------------------------------------
-// "forage 3 for 10m" / "mine 2 x25" / "chop until 500xp" -> Run
-// ---------------------------------------------------------------------------
-
-/**
- * Pulls a trailing limit clause off a string.
- * Returns {limit, rest} -- limit is null if no clause was found.
- */
-function extractLimit(text) {
-	let s = String(text).trim();
-	let limit = null;
-	let m;
-
-	if ((m = s.match(/(^|\s+)until\s+(\d+)\s*xp$/i))) {
-		limit = {kind: "xp", value: parseInt(m[2], 10)};
-		s = s.slice(0, m.index);
-	} else if ((m = s.match(/(^|\s+)x\s*(\d+)$/i))) {
-		limit = {kind: "count", value: parseInt(m[2], 10)};
-		s = s.slice(0, m.index);
-	} else if ((m = s.match(/(^|\s+)(\d+)\s*(?:actions?|hits?|successes)$/i))) {
-		limit = {kind: "count", value: parseInt(m[2], 10)};
-		s = s.slice(0, m.index);
-	} else if ((m = s.match(/(^|\s+)for\s+(.+)$/i))) {
-		const ms = parseDuration(m[2]);
-		if (ms) {
-			limit = {kind: "time", value: Math.min(ms, CONFIG.maxWaitMs)};
-			s = s.slice(0, m.index);
-		}
-	}
-
-	return {limit, rest: s.trim()};
-}
-
-/**
- * Parses one post-cycle action:
- *   waypoint 180 240   |   waypoint SeedHaven   |   gauntlet 3
- *   gauntlet Rust solo |   dungeon 5            |   dungeon
- */
-/**
- * Describes a plan for display. Only still reachable for a plan persisted
- * before the daily command was simplified to a single time budget (see
- * CHANGELOG) -- any plan set since then always has a budget, so dailyStatus
- * never calls this in practice, but it lets old persisted state still show
- * something sensible instead of crashing.
- */
-function describePlan(plan) {
-	const acts = Object.keys(plan);
-	if (!acts.length) return "nothing";
-
-	// Group activities that share a limit, for a compact summary.
-	const groups = new Map();
-	for (const act of acts) {
-		const key = describeLimit(plan[act]);
-		if (!groups.has(key)) groups.set(key, []);
-		groups.get(key).push(act);
-	}
-
-	if (groups.size === 1 && acts.length === Object.keys(ACTIVITIES).length) {
-		return `all ${[...groups.keys()][0]}`;
-	}
-
-	return [...groups.entries()]
-		.map(([lim, list]) => `${list.join("+")} ${lim}`)
-		.join(", ");
-}
-
-function parseFinisher(text) {
-	const t = String(text).trim();
-	if (!t) return null;
-
-	const m = t.match(/^(waypoint|wp|gauntlet|gaunt|dungeon|dg|deposit|dep)\b\s*(.*)$/i);
-	if (!m) return null;
-
-	const alias = m[1].toLowerCase();
-	const kind = alias === "wp" ? "waypoint"
-		: alias === "gaunt" ? "gauntlet"
-		: alias === "dg" ? "dungeon"
-		: alias === "dep" ? "deposit"
-		: alias;
-
-	let arg = m[2].trim();
-	if (kind === "waypoint" && !arg) return null;   // needs a destination
-
-	// Gauntlets always run solo, so drop a redundant trailing "solo".
-	if (kind === "gauntlet") arg = arg.replace(/\s*\bsolo\b\s*$/i, "").trim();
-
-	return {kind, arg: arg || null};
-}
-
-function describeFinisher(f) {
-	const base = f.arg ? `${f.kind} ${f.arg}` : f.kind;
-	return f.kind === "gauntlet" ? `${base} (solo)` : base;
-}
-
-function parseRun(text) {
-	if (!String(text).trim()) return null;
-
-	const {limit, rest} = extractLimit(text);
-	const s = rest;
-
-	const parts = s.trim().replace(/^!/, "").split(/\s+/);
-	const activity = (parts.shift() || "").toLowerCase();
-
-	if (activity === "grind") {
-		// "grind at <x> <y>" -- time only. There is no real command for
-		// grinding: it's just standing within range of a waypoint with
-		// nothing else queued, which the game auto-fights.
-		if (!limit || limit.kind !== "time") return null;
-		if ((parts[0] || "").toLowerCase() === "at") parts.shift();
-
-		const x = parseInt(parts[0], 10), y = parseInt(parts[1], 10);
-		if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
-
-		const run = new Run("grind", `${x},${y}`, limit);
-		run.targetPos = [x, y];
-		return run;
-	}
-
-	if (!ACTIVITIES[activity]) return null;
-
-	const node = parts.join(" ") || (CONFIG.autoNode ? AUTO : null);
-	return new Run(activity, node === "auto" ? AUTO : node, limit);
 }
 
 // ---------------------------------------------------------------------------
@@ -3189,83 +782,27 @@ function parseRun(text) {
 // ---------------------------------------------------------------------------
 
 function helpLines() {
-	const acts = Object.keys(ACTIVITIES).join("|");
-
 	return [
 		`${PLUGIN_NAME} v${VERSION} -- ${CMD} (alias /${ALIASES[0]})`,
 		"",
-		"SETUP",
-		`  ${CMD} on                     :watch PMs from ${CONFIG.botNick}`,
-		`  ${CMD} off                    :stop watching, cancel any run`,
-		`  ${CMD} status                 :what is running right now`,
+		"Passively watches DMs from the game bot and tracks your gathering --",
+		"it never sends anything to the game itself. Start, stop, and control",
+		"your own gathering in-game as usual; this only listens and keeps stats.",
 		"",
-		`QUEUE  -- a run is: <${acts}> [node] <limit>`,
-		"       where limit is: for <time> | x<N> hits | until <N>xp",
-		`  ${CMD} q forage for 10m       :forage ten minutes, node auto-picked`,
-		`  ${CMD} q mine x25             :mine until 25 successful actions`,
-		`  ${CMD} q chop until 500xp     :chop until 500xp gained`,
-		`  ${CMD} q fish 1 for 1h30m     :fish node 1 for an hour and a half`,
+		`  ${CMD} on                    :start watching PMs from ${CONFIG.botNick}`,
+		`  ${CMD} off                   :stop watching`,
+		`  ${CMD} status                :what's being watched right now, if anything`,
+		`  ${CMD} stats                 :today's totals per activity`,
+		`  ${CMD} stats yesterday       :also: week, all, days, YYYY-MM-DD`,
+		`  ${CMD} loot                  :session totals (since last restart)`,
+		`  ${CMD} map                   :node positions/travel times learned from your trips`,
+		`  ${CMD} nodes <activity>      :last node list seen for that activity, if any`,
+		`  ${CMD} levels                :last !skills line seen, if any`,
+		`  ${CMD} debug                 :echo every DM line with its parse`,
+		`  ${CMD} help                  :this list`,
 		"",
-		"  Queued runs happen one after another, then the queue empties.",
-		"  To repeat them endlessly instead, separate runs with | and use rotate:",
-		`  ${CMD} rotate forage for 10m | mine x25 | chop for 5m`,
-		"       forage 10m, then mine 25 hits, then chop 5m, then start over.",
-		"",
-		`  ${CMD} list                   :show what is running and queued`,
-		`  ${CMD} clear                  :empty queue and stop any rotation`,
-		"",
-		"DAILY  -- run gathering skills once a day, unattended, within a time budget",
-		`  ${CMD} daily 10h             :split 10h across every activity, travel included`,
-		`  ${CMD} daily 10h at 02:00    :same, scheduled for 02:00 UTC instead of the default`,
-		`  ${CMD} daily specialize hunt 75 :hunt gets 75% of the budget; one other activity`,
-		"                                rotates in daily for the remaining 25%, so every",
-		"                                activity is still covered without doing all of them.",
-		`  ${CMD} daily specialize off  :back to splitting the budget across every activity`,
-		`  ${CMD} daily                 :show schedule and next run`,
-		`  ${CMD} daily now             :run the cycle immediately, any time`,
-		`  ${CMD} daily accept          :allow a schedule that was warned about`,
-		`  ${CMD} daily no              :find a shorter route using closer nodes`,
-		`  ${CMD} daily nodes           :node picked per activity, flags any unmapped`,
-		`  ${CMD} daily options         :best available route and ways to proceed`,
-		`  ${CMD} daily ignore budget|travel|minimum :override options`,
-		`  ${CMD} daily adapt           :re-divide the window as travel is measured`,
-		`  ${CMD} daily recall <pct>    :only !recall if it saves >= pct% travel (default 25%)`,
-		`  ${CMD} daily safety <levels> :deposit + recall if the finishing node's Lv exceeds SUR + levels (default 5)`,
-		"       Unaccepted schedules are reminded every 30m from 00:00 UTC.",
-		`  ${CMD} daily off             :cancel`,
-		"       The budget is a wall-clock ceiling; travel is estimated and subtracted first.",
-		"       The game day resets at 00:00 UTC; times are UTC.",
-		"       !recall costs a consumable, so it is only used when the route",
-		"       from home beats the route from where you are by enough (see recall above).",
-		`  ${CMD} after gauntlet 3      :run something once gathering finishes, the options are waypoint, gauntlet ran as solo, dungeon, or deposit`,
-		`  ${CMD} after deposit | waypoint 180 240 | dungeon 5    :chain several`,
-		`  ${CMD} after clear           :cancel post-cycle actions`,
-		`  ${CMD} map                   :learned node positions and travel times`,
-		`  ${CMD} home                  :read home town from the game (!home)`,
-		`  ${CMD} home <x>,<y>          :override it manually`,
-		"",
-		"NODES",
-		`  ${CMD} nodes <activity>       :list nodes, * = your level allows it`,
-		`  ${CMD} levels                 :your skill levels`,
-		`  ${CMD} auto on|off            :auto-pick highest usable node (default on)`,
-		`  ${CMD} refresh                :clear cached levels and node lists`,
-		"",
-		"CONTROL",
-		`  ${CMD} skip                   :abandon current run, start next`,
-		`  ${CMD} stop                   :stop everything, clear queue`,
-		`  ${CMD} resume                 :un-halt after a hardcore death`,
-		`  ${CMD} hardcore on|off        :on a [HARDCORE] death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equip best (on by default)`,
-		`  ${CMD} hunt gear               :snapshot currently equipped gear (!inv) as the hunt loadout`,
-		`  ${CMD} hunt                    :show the saved hunt loadout, if any`,
-		`  ${CMD} hunt gear clear         :remove it`,
-		"       Also: mine|chop|salvage|forage|fish|grind. Saved loadout is !equip'd before each run of that activity.",
-		`  ${CMD} loot                   :session totals (since last restart)`,
-		`  ${CMD} stats                  :today's totals per activity`,
-		`  ${CMD} stats yesterday        :also: week, all, days, YYYY-MM-DD`,
-		`  ${CMD} debug                  :echo every DM line with its parse`,
-		`  ${CMD} help                   :this list`,
-		"",
-		"Time formats: 45s, 10m, 1h30m, 04:30.  Node names with spaces are fine.",
+		"Node lists and !skills are only ever learned by seeing you run those",
+		"commands yourself -- this plugin has no way to ask for them.",
 	];
 }
 
@@ -3285,249 +822,47 @@ module.exports = {
 				if (!s) {
 					s = new Session(target.network, client, target.chan);
 					sessions.set(key, s);
-					// A Lounge restart drops in-memory state; rehydrate any
-					// saved daily schedule the first time this session is used.
-					if (s.restoreDaily()) {
-						s.say(`Restored: ${s.dailyStatus()}`);
-					}
-					const savedHardcore = readHardcoreStore()[key];
-					if (s.restoreHardcore()) {
-						// Purely reactive to incoming PMs, with no timer of its own to
-						// self-attach on -- so unlike daily, it must attach right here.
-						// Hardcore recovery defaults to on, so this fires even with no
-						// prior config -- word it as a restore only when one exists.
-						const label = savedHardcore === true
-							? "Restored: hardcore death recovery on"
-							: "Hardcore death recovery on by default (\"" + CMD + " hardcore off\" to disable)";
-						s.say(s.attach()
-							? `${label}, watching PMs.`
-							: `${label}, but could not attach the PM listener.`);
-					}
-					s.restoreGear();
 				}
 				s.client = client;
 				s.chanId = target.chan;
 
 				const sub = (args[0] || "status").toLowerCase();
 				const rest = args.slice(1).join(" ");
-				const acts = Object.keys(ACTIVITIES).join("|");
-
-				// Anything that needs to READ DM's replies is useless without
-				// the listener. Silently queueing work that can never observe a
-				// result is worse than failing loudly, so attach on demand.
-				const NEEDS_LISTENER = ["q", "queue", "rotate", "nodes", "levels", "skip", "resume", "daily", "after", "hardcore", "grind"];
-				if ((NEEDS_LISTENER.includes(sub) || ACTIVITIES[sub]) && !s.attached) {
-					if (!s.attach()) return;   // attach() already reported why
-					s.say(`Auto-attached (run ${CMD} on to do this explicitly).`);
-				}
 
 				switch (sub) {
 					case "on":
-						s.halted = null;
 						if (s.attach()) s.say(`Watching PMs from ${CONFIG.botNick}.`);
 						break;
 
 					case "off":
-						s.stopCurrent("detached");
 						s.detach();
 						s.say("Detached.");
 						break;
 
-					case "q":
-					case "queue": {
-						const run = parseRun(rest);
-						if (!run) {
-							s.say(`Usage: ${CMD} q <${acts}> [node] [for 10m | x25 | until 500xp]`);
-							s.say(`       ${CMD} q grind at <x> <y> for 30m   (time only -- no real grind command exists)`);
+					case "status": {
+						if (!s.attached) {
+							s.say(`${PLUGIN_NAME} v${VERSION} | not attached -- ${CMD} on to start watching`);
 							break;
 						}
-						s.queue.push(run);
-						s.say(`Queued (${s.queue.length}): ${run.describe()}`);
-						if (!s.current) s.advance();
+						const w = s.watch;
+						if (!w) {
+							s.say(`${PLUGIN_NAME} v${VERSION} | attached=true | nothing being watched`);
+							break;
+						}
+						if (w.state === "traveling") {
+							s.say(
+								`Watching !${w.activity} -- travelling to ${w.node} ` +
+								`(${w.travelSteps} steps, ${fmt(Date.now() - w.travelStartedAt)})`
+							);
+							break;
+						}
+						const rate = w.ticks ? Math.round((w.successes / w.ticks) * 100) : 0;
+						s.say(
+							`Watching !${w.activity} @ ${w.node} -- ${fmt(Date.now() - w.startedAt)}, ` +
+							`${w.successes}/${w.ticks} hits (${rate}%), +${w.xp}xp`
+						);
 						break;
 					}
-
-					case "rotate": {
-						if (!rest) {
-							s.rotation = null;
-							s.say("Rotation cleared.");
-							break;
-						}
-						const runs = rest.split("|").map((x) => parseRun(x)).filter(Boolean);
-						if (!runs.length) {
-							s.say(`Usage: ${CMD} rotate forage 3 for 10m | mine 2 x25`);
-							break;
-						}
-						s.rotation = runs;
-						s.queue = runs.map(cloneRun);
-						s.say(`Rotation set: ${runs.map((r) => r.describe()).join(" -> ")}`);
-						if (!s.current) s.advance();
-						break;
-					}
-
-					case "nodes": {
-						const act = (rest || "").toLowerCase();
-						if (!ACTIVITIES[act]) {
-							s.say(`Usage: ${CMD} nodes <${acts}>`);
-							break;
-						}
-						(async () => {
-							const level = await s.getLevel(act);
-							const nodes = await s.getNodes(act);
-							if (!nodes.length) {
-								s.say(`No ${ACTIVITIES[act].noun} parsed -- run ${CMD} debug and check the format.`);
-								return;
-							}
-							nodes.slice().sort((a, b) => b.level - a.level).forEach((n) => {
-								const ok = level === null ? "?" : n.level <= level ? "*" : " ";
-								const extra = [n.terrain, n.quality].filter(Boolean).join(", ");
-								s.say(`${ok} Lv${String(n.level).padStart(3)}+  [${n.id}] ${n.name}${extra ? "  (" + extra + ")" : ""}`);
-							});
-						})();
-						break;
-					}
-
-					case "auto": {
-						const v = (rest || "").toLowerCase();
-						if (v === "on" || v === "off") CONFIG.autoNode = v === "on";
-						s.say(`Auto node selection ${CONFIG.autoNode ? "on" : "off"}.`);
-						break;
-					}
-
-					case "hardcore": {
-						const v = (rest || "").toLowerCase();
-						if (v === "on" || v === "off") {
-							s.hardcore = v === "on";
-							s.persistHardcore();
-						}
-						s.say(`Hardcore death recovery ${s.hardcore ? "on" : "off"} (default: on)` +
-							(s.hardcore
-								? ` -- on a [HARDCORE]-tagged death: !home ${CONFIG.hardcoreHomeTown}, !recall, !equip best.`
-								: " -- a hardcore death will still halt the queue, but nothing recovers automatically."));
-						break;
-					}
-
-					case "hunt":
-					case "mine":
-					case "chop":
-					case "salvage":
-					case "forage":
-					case "fish":
-					case "grind": {
-						const activity = sub;
-						const action = (rest || "").trim().toLowerCase();
-
-						if (!action || action === "show") {
-							const ids = s.gear[activity];
-							s.say(ids && ids.length
-								? `${activity} loadout (${ids.length}/${GEAR_SLOTS.length} slots): ${ids.join(", ")}`
-								: `No ${activity} loadout saved. ${CMD} ${activity} gear to snapshot your current gear.`);
-							break;
-						}
-
-						if (action === "clear" || action === "off" || action === "none") {
-							const had = Boolean(s.gear[activity]);
-							delete s.gear[activity];
-							s.persistGear();
-							s.say(had ? `${activity} loadout cleared.` : `No ${activity} loadout was saved.`);
-							break;
-						}
-
-						if (action !== "gear") {
-							s.say(`Usage: ${CMD} ${activity}             show the saved loadout, if any`);
-							s.say(`       ${CMD} ${activity} gear        snapshot currently equipped gear as the ${activity} loadout`);
-							s.say(`       ${CMD} ${activity} gear clear  remove it`);
-							break;
-						}
-
-						(async () => {
-							s.say("Reading !inv...");
-							let lines = [];
-							try {
-								lines = await s.ask("!inv", null, CONFIG.invCollectMs);
-							} catch (err) {
-								lines = [];
-							}
-
-							const found = {};
-							for (const line of lines) {
-								const slot = parseEquippedSlot(line);
-								if (slot && slot.id) found[slot.slot] = slot.id;
-							}
-
-							const ids = GEAR_SLOTS.map((slot) => found[slot]).filter(Boolean);
-							if (!ids.length) {
-								s.say("Could not parse any equipped items from !inv -- try again, or run !inv manually to check the format.");
-								return;
-							}
-
-							s.gear[activity] = ids;
-							s.persistGear();
-
-							const missing = GEAR_SLOTS.filter((slot) => !found[slot]);
-							s.say(`Saved ${activity} loadout: ${ids.length}/${GEAR_SLOTS.length} slots` +
-								(missing.length ? ` | empty: ${missing.join(", ")}` : "") +
-								` -- equipped automatically before each ${activity} run.`);
-						})();
-						break;
-					}
-
-					case "levels": {
-						const show = () => {
-							if (!s.levels.size) {
-								s.say("No stats parsed from " + CONFIG.levelCommand);
-								return;
-							}
-							const gather = [], other = [];
-							for (const [k, v] of s.levels) {
-								const label = `${STAT_NAMES[k] || k} ${v.level}`;
-								(Object.values(ACTIVITIES).some((a) => a.stat === k) ? gather : other).push(label);
-							}
-							s.say(`gathering: ${gather.join(", ")}`);
-							if (other.length) s.say(`other: ${other.join(", ")}`);
-						};
-						if (s.levels.size) show();
-						else (async () => { await s.getLevel("forage"); show(); })();
-						break;
-					}
-
-					case "refresh":
-						s.levels.clear();
-						s.nodeCache.clear();
-						s.say("Level and node caches cleared.");
-						break;
-
-					case "skip":
-						s.stopCurrent("skipped");
-						s.advance();
-						break;
-
-					case "stop":
-						s.stopCurrent("stopped");
-						s.queue = [];
-						s.rotation = null;
-						break;
-
-					case "resume":
-						s.halted = null;
-						s.say("Resumed.");
-						s.advance();
-						break;
-
-					case "list":
-						if (s.current) s.say(`* running: ${s.current.describe()}`);
-						if (!s.queue.length) {
-							s.say("Queue empty." + (s.rotation ? " (rotation will refill)" : ""));
-							break;
-						}
-						s.queue.forEach((r, i) => s.say(`${i + 1}. ${r.describe()}`));
-						break;
-
-					case "clear":
-						s.queue = [];
-						s.rotation = null;
-						s.say("Queue and rotation cleared.");
-						break;
 
 					case "loot": {
 						const t = s.totals;
@@ -3536,430 +871,6 @@ module.exports = {
 							.map(([n, q]) => `${q}x ${n}`)
 							.join(", ");
 						s.say(`Session: ${t.runs} runs, ${t.successes} hits, +${t.xp}xp${items ? " -- " + items : ""}`);
-						break;
-					}
-
-					case "daily": {
-						const arg = rest.trim();
-
-						if (!arg) {
-							s.say(s.dailyStatus());
-							break;
-						}
-
-						if (/^ignore\b/i.test(arg)) {
-							const what = arg.replace(/^ignore\s*/i, "").trim().toLowerCase();
-							const map = {
-								budget: "budget", total: "budget", time: "budget", window: "budget",
-								travel: "travel",
-								minimum: "minimum", min: "minimum", gather: "minimum",
-							};
-							const key = map[what];
-
-							if (!key) {
-								s.say(`Usage: ${CMD} daily ignore budget|travel|minimum   (or "none" to reset)`);
-								if (what === "none" || what === "clear" || what === "reset") {
-									s.daily.ignore = null;
-									s.persistDaily();
-									s.say("All thresholds re-enabled.");
-								}
-								break;
-							}
-
-							s.daily.ignore = Object.assign({}, s.daily.ignore, {[key]: true});
-							s.daily.accepted = true;
-							s.pendingWarnings = null;
-							s.pendingSummary = null;
-							s.clearReminders();
-							s.persistDaily();
-							s.say(`Ignoring ${key}. Active exemptions: ` +
-								Object.keys(s.daily.ignore).join(", "));
-							break;
-						}
-
-						if (/^recall\b/i.test(arg)) {
-							const what = arg.replace(/^recall\s*/i, "").trim().toLowerCase();
-
-							if (/^(default|reset|clear)$/.test(what)) {
-								s.daily.recallThreshold = null;
-								s.persistDaily();
-								s.say(`Recall threshold reset to default (${Math.round(CONFIG.recallSavingsThreshold * 100)}%).`);
-								break;
-							}
-
-							const m = what.match(/^(\d+(?:\.\d+)?)\s*%?$/);
-							const pct = m ? parseFloat(m[1]) : NaN;
-
-							if (!m || pct < 0 || pct > 100) {
-								s.say(`Usage: ${CMD} daily recall <percent>   e.g. ${CMD} daily recall 25   (or "default" to reset)`);
-								s.say(`Currently: ${Math.round(s.recallThreshold() * 100)}%`);
-								break;
-							}
-
-							s.daily.recallThreshold = pct / 100;
-							s.persistDaily();
-							s.say(`Recall threshold set to ${pct}% -- !recall is used only when it cuts route travel by at least that much.`);
-							break;
-						}
-
-						if (/^safety\b/i.test(arg)) {
-							const what = arg.replace(/^safety\s*/i, "").trim().toLowerCase();
-
-							if (/^(default|reset|clear)$/.test(what)) {
-								s.daily.survivalMargin = null;
-								s.persistDaily();
-								s.say(`Safety margin reset to default (SUR +${CONFIG.survivalSafetyMargin}).`);
-								break;
-							}
-
-							const m = what.match(/^(\d+)$/);
-							const levels = m ? parseInt(m[1], 10) : NaN;
-
-							if (!m || levels < 0) {
-								s.say(`Usage: ${CMD} daily safety <levels>   e.g. ${CMD} daily safety 5   (or "default" to reset)`);
-								s.say(`Currently: SUR +${s.survivalMargin()}`);
-								break;
-							}
-
-							s.daily.survivalMargin = levels;
-							s.persistDaily();
-							s.say(`Safety margin set to SUR +${levels} -- deposit + recall trigger once the finishing node's ` +
-								`level exceeds that.`);
-							break;
-						}
-
-						if (/^specializ/i.test(arg)) {
-							const what = arg.replace(/^specializ[a-z]*\s*/i, "").trim();
-
-							if (!what) {
-								s.say(s.daily.specialty
-									? `Specializing in ${s.daily.specialty.activity} ` +
-									  `(${Math.round(s.daily.specialty.pct * 100)}%) -- one other activity ` +
-									  `rotates in for the rest each day.`
-									: "No specialty set -- the budget splits evenly across every activity.");
-								break;
-							}
-
-							if (/^(off|none|clear)$/i.test(what)) {
-								s.daily.specialty = null;
-								// The 6-way plan this reverts to was never previewed
-								// while specialty was active -- re-check it before
-								// trusting it to run unattended.
-								s.daily.accepted = false;
-								s.persistDaily();
-								s.say("Specialty cleared -- back to splitting the budget across every activity.");
-								break;
-							}
-
-							const m = what.match(/^(\S+)(?:\s+(\d+))?$/);
-							const act = m ? resolveActivity(m[1]) : null;
-
-							if (!act) {
-								s.say(`Usage: ${CMD} daily specialize <activity> [pct]   e.g. ${CMD} daily specialize hunt 75`);
-								s.say(`       ${CMD} daily specialize off`);
-								break;
-							}
-
-							const pct = m[2] ? parseInt(m[2], 10)
-								: s.daily.specialty ? Math.round(s.daily.specialty.pct * 100)
-								: 75;
-
-							if (pct < 1 || pct > 99) {
-								s.say("Percent must be between 1 and 99.");
-								break;
-							}
-
-							s.daily.specialty = {activity: act, pct: pct / 100};
-							// Specialty picks its own stops fresh each day -- there
-							// is no fixed plan left to preview/accept up front.
-							s.daily.accepted = true;
-							s.pendingWarnings = null;
-							s.pendingSummary = null;
-							s.clearReminders();
-							s.persistDaily();
-							s.say(
-								`Specializing in ${act} (${pct}%) -- one other activity rotates in for the ` +
-								`remaining ${100 - pct}% each day.` +
-								(s.daily.budget ? "" : ` Needs a time budget (${CMD} daily 10h).`)
-							);
-							break;
-						}
-
-						if (/^(adapt|adaptive)$/i.test(arg)) {
-							if (!s.daily.budget) {
-								s.say(`Adapt needs a budget -- set one with ${CMD} daily 10h`);
-								break;
-							}
-							s.daily.adapt = !s.daily.adapt;
-							s.daily.accepted = true;
-							s.pendingWarnings = null;
-							s.pendingSummary = null;
-							s.clearReminders();
-							s.persistDaily();
-							s.say(s.daily.adapt
-								? "Adapt on -- the window is re-divided across remaining stops as real travel is measured."
-								: "Adapt off.");
-							break;
-						}
-
-						if (/^(no|optimi[sz]e|closer|rethink)$/i.test(arg)) {
-							if (!s.daily.enabled) {
-								s.say("No daily cycle set.");
-								break;
-							}
-
-							(async () => {
-								s.say("Looking for a shorter route using closer nodes...");
-
-								let opt = null;
-								try {
-									opt = await s.optimiseRoute(s.lastPos || s.home());
-								} catch (err) {
-									opt = null;
-								}
-
-								if (!opt) {
-									s.say("Could not build an alternative -- no mapped nodes to choose from.");
-									return;
-								}
-
-								if (!opt.steps.length) {
-									s.say("No closer alternatives -- every activity has only one " +
-										"reachable node at your level.");
-									let est = null;
-									try {
-										est = await s.estimateDaily(s.lastPos || s.home());
-									} catch (err) {
-										est = null;
-									}
-									s.sayOptions(est);
-									return;
-								}
-
-								s.daily.nodeOverrides = Object.fromEntries(
-									Object.entries(opt.choice).map(([a, n]) => [a, n.name])
-								);
-								s.daily.accepted = false;
-								s.persistDaily();
-
-								opt.steps.forEach((line) => s.say("  " + line));
-
-								const r = opt.result;
-								s.say(
-									`New route: ${r.ordered.map((st) => st.act).join(" -> ")} -- ` +
-									`~${fmt(r.travelMs)} travel, ${fmt(r.minPerStop)} per stop`
-								);
-
-								if (r.ok) {
-									s.daily.accepted = true;
-									s.pendingWarnings = null;
-									s.pendingSummary = null;
-									s.clearReminders();
-									s.persistDaily();
-									s.say("This clears the thresholds and will run as scheduled.");
-								} else {
-									s.say(`Still short of ${fmt(CONFIG.minGatherPerStopMs)} per stop. ` +
-										`${CMD} daily accept to run it anyway.`);
-								}
-							})();
-							break;
-						}
-
-						if (/^nodes$/i.test(arg)) {
-							if (!s.daily.enabled) {
-								s.say("No daily cycle set.");
-								break;
-							}
-							(async () => {
-								let est = null;
-								try {
-									est = await s.estimateDaily(s.lastPos || s.home());
-								} catch (err) {
-									est = null;
-								}
-
-								if (!est || (!est.ordered.length && !est.unmapped.length)) {
-									s.say("Could not resolve any nodes for the current plan.");
-									return;
-								}
-
-								est.ordered.forEach((st) => {
-									const leg = st.fromDist
-										? ` (+${fmt(travelEstimate(st.fromDist, s.nodeSpeed(st.act, st.node.name)).ms)} travel)`
-										: "";
-									s.say(`  ${st.act.padEnd(8)} ${st.node.name} (Lv${st.node.level}) @ ${st.pos[0]},${st.pos[1]}${leg}`);
-								});
-
-								est.unmapped.forEach((st) => {
-									s.say(`  ${st.act.padEnd(8)} ${st.node.name} (Lv${st.node.level}) -- ` +
-										`location unknown, visit once with ${CMD} q ${st.act} to map it`);
-								});
-							})();
-							break;
-						}
-
-						if (/^(options|opts|why)$/i.test(arg)) {
-							(async () => {
-								let est = null;
-								try {
-									est = await s.estimateDaily(s.lastPos || s.home());
-								} catch (err) {
-									est = null;
-								}
-								const summary = s.dailySummarySentence(est);
-								if (summary) s.say(summary);
-								s.sayOptions(est);
-							})();
-							break;
-						}
-
-						if (/^(accept|confirm|force)$/i.test(arg)) {
-							if (!s.daily.enabled) {
-								s.say("No daily cycle set.");
-								break;
-							}
-							s.daily.accepted = true;
-							s.pendingWarnings = null;
-							s.pendingSummary = null;
-							s.clearReminders();
-							s.persistDaily();
-							s.say("Accepted -- the daily cycle will run as scheduled.");
-							break;
-						}
-
-						if (/^(now|run|start)$/i.test(arg)) {
-							if (!s.daily.enabled) {
-								s.say(`No daily cycle set. Configure one first, e.g. ${CMD} daily 10h`);
-								break;
-							}
-							if (s.current || s.queue.length) {
-								s.say(`Cannot start now -- work already in progress (${s.queue.length} queued).`);
-								break;
-							}
-							s.say("Starting the daily cycle now.");
-							s.fireDaily();
-							break;
-						}
-
-						if (/^(off|stop|disable)$/i.test(arg)) {
-							s.daily.enabled = false;
-							s.pendingWarnings = null;
-							s.pendingSummary = null;
-							s.clearReminders();
-							if (s.dailyTimer) {
-								clearTimeout(s.dailyTimer);
-								s.dailyTimer = null;
-							}
-							s.persistDaily();
-							s.say("Daily cycle off.");
-							break;
-						}
-
-						// Optional "at HH:MM" suffix, then a total time budget --
-						// this is the only way to configure the daily cycle now;
-						// see "specialize" above for narrowing it to two activities.
-						let text = arg;
-						let atMin = s.daily.atMin;
-						const at = text.match(/\s*\bat\s+(\S+)\s*(?:utc)?$/i);
-						if (at) {
-							const parsed = parseUtcTime(at[1]);
-							if (parsed === null) {
-								s.say(`Bad time "${at[1]}" -- use 24h UTC, e.g. at 02:00`);
-								break;
-							}
-							atMin = parsed;
-							text = text.slice(0, at.index);
-						}
-
-						const budget = parseDuration(text.replace(/^(?:within|total|budget|in|for)\s+/i, "").trim());
-
-						if (!budget) {
-							s.say(`Usage: ${CMD} daily 10h [at 02:00]`);
-							s.say(`       ${CMD} daily specialize hunt 75   run hunt most days, one other rotates in`);
-							s.say(`       ${CMD} daily off`);
-							break;
-						}
-
-						const plan = Object.fromEntries(Object.keys(ACTIVITIES).map((a) => [a, {kind: "share"}]));
-
-						s.daily = {
-							// Specialty mode picks its own two stops fresh each
-							// day, so there is nothing to preview/accept here.
-							enabled: true, atMin, plan, budget, accepted: Boolean(s.daily.specialty),
-							nodeOverrides: null, ignore: null, adapt: false,
-							recallThreshold: s.daily.recallThreshold,
-							survivalMargin: s.daily.survivalMargin,
-							specialty: s.daily.specialty,
-							specialtyCursor: s.daily.specialtyCursor || 0,
-							lastRunDay: s.daily.lastRunDay,
-						};
-						s.persistDaily();
-						s.armDaily();
-						s.say(s.dailyStatus());
-
-						// Preview the route so a bad schedule is caught now,
-						// not at 3am. Specialty mode picks its own two stops
-						// fresh each day, so a plain 6-way preview here would
-						// be misleading -- skip it.
-						if (!s.daily.specialty) (async () => {
-							let est = null;
-							try {
-								est = await s.estimateDaily(s.lastPos || s.home());
-							} catch (err) {
-								est = null;
-							}
-							if (!est) return;
-
-							s.say(`Estimate: ${est.ordered.length} stops, ` +
-								`~${fmt(est.estTravel)} travel + ${fmt(est.gatherMs)} gathering ` +
-								`= ${fmt(est.estTravel + est.gatherMs)}`);
-
-							const warns = s.dailyWarnings(est);
-							const summary = s.dailySummarySentence(est);
-
-							s.pendingWarnings = warns.length ? warns : null;
-							s.pendingSummary = warns.length ? summary : null;
-
-							if (!warns.length) {
-								s.clearReminders();
-								return;
-							}
-
-							s.say(summary);
-							s.say(`This will not run until accepted. Try ${CMD} daily no ` +
-								`for a shorter route, or see ${CMD} daily options`);
-							s.armReminders();
-						})();
-						break;
-					}
-
-					case "after": {
-						const arg = rest.trim();
-
-						if (!arg) {
-							s.say(s.finishers.length
-								? `After the daily cycle: ${s.finishers.map(describeFinisher).join(", ")}`
-								: `Nothing set. Try ${CMD} after deposit | gauntlet 3 | dungeon 5`);
-							break;
-						}
-
-						if (/^(off|none|clear)$/i.test(arg)) {
-							s.finishers = [];
-							s.persistDaily();
-							s.say("Post-cycle actions cleared.");
-							break;
-						}
-
-						const parts = arg.split("|").map((x) => parseFinisher(x));
-						if (parts.some((x) => !x)) {
-							s.say(`Usage: ${CMD} after waypoint <x> <y>|<town> | gauntlet [id] | dungeon [id] | deposit`);
-							s.say(`       ${CMD} after clear`);
-							break;
-						}
-
-						s.finishers = parts;
-						s.persistDaily();
-						s.say(`After the daily cycle: ${parts.map(describeFinisher).join(", ")}`);
 						break;
 					}
 
@@ -3987,53 +898,18 @@ module.exports = {
 						break;
 					}
 
-					case "home": {
-						const arg = rest.trim();
-
-						if (!arg) {
-							// Ask the game rather than trusting the cache.
-							(async () => {
-								const h = await s.fetchHome();
-								if (h) {
-									const known = Object.keys(s.knownTowns());
-									s.say(`Home: ${h.town} (${h.coords[0]},${h.coords[1]})` +
-										(h.available.length > 1
-											? ` | available: ${h.available.join(", ")}`
-											: "") +
-										(known.length > 1
-											? ` | known coords: ${known.join(", ")}`
-											: ""));
-								} else {
-									const c = s.home();
-									s.say(`Could not read !home -- using stored ${c[0]},${c[1]}. ` +
-										`Set manually with ${CMD} home <x>,<y>`);
-								}
-							})();
-							break;
-						}
-
-						const m = arg.match(/^(\d+)\s*[, ]\s*(\d+)$/);
-						if (!m) {
-							s.say(`Usage: ${CMD} home            read it from the game`);
-							s.say(`       ${CMD} home 180,240   set manually`);
-							break;
-						}
-
-						s.setHome([parseInt(m[1], 10), parseInt(m[2], 10)]);
-						s.say(`Home set to ${m[1]},${m[2]}.`);
-						break;
-					}
-
 					case "map": {
 						const m = s.mapStore();
 						const keys = Object.keys(m.nodes);
 						if (!keys.length) {
-							s.say("No nodes mapped yet -- positions are learned as you travel to them.");
+							s.say("No nodes mapped yet -- positions are learned by watching you gather.");
 							break;
 						}
 						const timed = keys.map((k) => m.nodes[k]).filter((n) => n.msPerUnit);
-						s.say(`${keys.length} nodes mapped, ${timed.length} with a measured travel speed` +
-							(s.lastPos ? ` | you are near ${s.lastPos[0]},${s.lastPos[1]}` : ""));
+						s.say(
+							`${keys.length} nodes mapped, ${timed.length} with a measured travel speed` +
+							(s.lastPos ? ` | last known position ${s.lastPos[0]},${s.lastPos[1]}` : "")
+						);
 						keys.map((k) => m.nodes[k])
 							.sort((a, b) => a.activity.localeCompare(b.activity))
 							.forEach((n) => {
@@ -4046,48 +922,42 @@ module.exports = {
 						break;
 					}
 
-					case "help":
-					case "?":
-						helpLines().forEach((l) => s.say(l));
+					case "nodes": {
+						const act = resolveActivity(rest.trim());
+						if (!act) {
+							s.say(`Usage: ${CMD} nodes <activity>   (shows the last list seen for it, if any)`);
+							break;
+						}
+						const hit = s.nodeCache.get(act);
+						if (!hit) {
+							s.say(`No ${act} node list seen yet -- run "!${act} ${ACTIVITIES[act].noun}" yourself in-game once.`);
+							break;
+						}
+						hit.nodes.slice().sort((a, b) => b.level - a.level).forEach((n) => {
+							const extra = [n.terrain, n.quality].filter(Boolean).join(", ");
+							s.say(`  Lv${String(n.level).padStart(3)}+  [${n.id}] ${n.name}${extra ? "  (" + extra + ")" : ""}`);
+						});
 						break;
+					}
+
+					case "levels": {
+						if (!s.levels.size) {
+							s.say(`No !skills line seen yet -- run !skills yourself in-game once.`);
+							break;
+						}
+						s.say([...s.levels.entries()].map(([k, v]) => `${k}:${v.level}`).join(" "));
+						break;
+					}
 
 					case "debug":
 						s.debug = !s.debug;
 						s.say(`Debug echo ${s.debug ? "on" : "off"}.`);
 						break;
 
-					case "status": {
-						if (!s.current) {
-							s.say(`${PLUGIN_NAME} v${VERSION} | attached=${s.attached} idle, queued=${s.queue.length}` +
-								(s.halted ? ` HALTED: ${s.halted}` : ""));
-							break;
-						}
-						const r = s.current;
-						if (r.state === "pending") {
-							s.say(`${r.describe()} -- awaiting start confirmation from ${CONFIG.botNick}`);
-							break;
-						}
-						if (r.state === "traveling") {
-							s.say(`${r.describe()} -- travelling to ${r.confirmedNode}` +
-								` (${r.travelSteps} steps, ${fmt(Date.now() - r.travelStartedAt)}` +
-								(r.coords ? `, at ${r.coords[0]},${r.coords[1]}` : "") + ")");
-							break;
-						}
-						const pct = r.progress();
-						const prog = pct === null ? "unbounded" : `${Math.min(100, Math.round(pct * 100))}%`;
-						const rem = r.msRemaining();
-						// With no stall detection, this is how you tell a live run
-						// from a dead one -- check when the last tick landed.
-						const quiet = r.lastTick ? Date.now() - r.lastTick : 0;
-						s.say(
-							`${r.describe()} -- ${prog}` +
-							(rem !== null ? ` (${fmt(rem)} left)` : "") +
-							` | ${r.successes}/${r.ticks} hits, +${r.xp}xp` +
-							(r.ticks ? ` | last tick ${fmt(quiet)} ago` : "") +
-							` | queued=${s.queue.length}`
-						);
+					case "help":
+					case "?":
+						helpLines().forEach((l) => s.say(l));
 						break;
-					}
 
 					default:
 						s.say(`Unknown subcommand "${sub}". Try ${CMD} help`);

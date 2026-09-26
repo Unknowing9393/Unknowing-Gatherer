@@ -1,7 +1,7 @@
 {
 	"name": "thelounge-plugin-seedrpg-gathering",
-	"version": "0.6.0",
-	"description": "Queue and time SeedRPG gathering activities from The Lounge",
+	"version": "1.1.0",
+	"description": "Passively track SeedRPG gathering stats from The Lounge -- read-only, sends nothing",
 	"main": "index.js",
 	"keywords": [
 		"thelounge",
